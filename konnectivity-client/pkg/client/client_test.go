@@ -20,15 +20,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 )
 
 func TestDial(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
 	ctx := context.Background()
 	s, ps := pipe()
 	ts := testServer(ps, 100)
@@ -38,7 +42,7 @@ func TestDial(t *testing.T) {
 
 	tunnel := &grpcTunnel{
 		stream:      s,
-		pendingDial: make(map[int64]chan<- dialResult),
+		pendingDial: make(map[int64]pendingDial),
 		conns:       make(map[int64]*conn),
 	}
 
@@ -51,7 +55,7 @@ func TestDial(t *testing.T) {
 	}
 
 	if ts.packets[0].Type != client.PacketType_DIAL_REQ {
-		t.Fatalf("expect packet.type %v; got %v", client.PacketType_CLOSE_REQ, ts.packets[0].Type)
+		t.Fatalf("expect packet.type %v; got %v", client.PacketType_DIAL_REQ, ts.packets[0].Type)
 	}
 
 	if ts.packets[0].GetDialRequest().Address != "127.0.0.1:80" {
@@ -59,7 +63,60 @@ func TestDial(t *testing.T) {
 	}
 }
 
+// TestDialRace exercises the scenario where serve() observes and handles DIAL_RSP
+// before DialContext() does any work after sending the DIAL_REQ.
+func TestDialRace(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ctx := context.Background()
+	s, ps := pipe()
+	ts := testServer(ps, 100)
+
+	defer ps.Close()
+	defer s.Close()
+
+	tunnel := &grpcTunnel{
+		// artificially delay after calling Send, ensure handoff of result from serve to DialContext still works
+		stream:      fakeSlowSend{s},
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
+
+	go tunnel.serve(&fakeConn{})
+	go ts.serve()
+
+	_, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
+	if err != nil {
+		t.Fatalf("expect nil; got %v", err)
+	}
+
+	if ts.packets[0].Type != client.PacketType_DIAL_REQ {
+		t.Fatalf("expect packet.type %v; got %v", client.PacketType_DIAL_REQ, ts.packets[0].Type)
+	}
+
+	if ts.packets[0].GetDialRequest().Address != "127.0.0.1:80" {
+		t.Errorf("expect packet.address %v; got %v", "127.0.0.1:80", ts.packets[0].GetDialRequest().Address)
+	}
+}
+
+// fakeSlowSend wraps ProxyService_ProxyClient and adds an artificial 1 second delay after calling Send
+type fakeSlowSend struct {
+	client.ProxyService_ProxyClient
+}
+
+func (s fakeSlowSend) Send(p *client.Packet) error {
+	// send the request so it can start being processed immediately
+	err := s.ProxyService_ProxyClient.Send(p)
+	// delay returning to simulate slowness on the client side,
+	// to exercise serve() observing/handling the DIAL_RSP before
+	// the client does any post-Send() work
+	time.Sleep(time.Second)
+	return err
+}
+
 func TestData(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
 	ctx := context.Background()
 	s, ps := pipe()
 	ts := testServer(ps, 100)
@@ -69,7 +126,7 @@ func TestData(t *testing.T) {
 
 	tunnel := &grpcTunnel{
 		stream:      s,
-		pendingDial: make(map[int64]chan<- dialResult),
+		pendingDial: make(map[int64]pendingDial),
 		conns:       make(map[int64]*conn),
 	}
 
@@ -118,6 +175,8 @@ func TestData(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
 	ctx := context.Background()
 	s, ps := pipe()
 	ts := testServer(ps, 100)
@@ -127,7 +186,7 @@ func TestClose(t *testing.T) {
 
 	tunnel := &grpcTunnel{
 		stream:      s,
-		pendingDial: make(map[int64]chan<- dialResult),
+		pendingDial: make(map[int64]pendingDial),
 		conns:       make(map[int64]*conn),
 	}
 
@@ -148,6 +207,62 @@ func TestClose(t *testing.T) {
 	}
 	if ts.packets[1].GetCloseRequest().ConnectID != 100 {
 		t.Errorf("expect connectID=100; got %d", ts.packets[1].GetCloseRequest().ConnectID)
+	}
+}
+
+func TestCloseTimeout(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ctx := context.Background()
+	s, ps := pipe()
+	ts := testServer(ps, 100)
+
+	// sending a nil response for close handler should trigger the timeout
+	// since we never receive CLOSE_RSP
+	ts.handlers[client.PacketType_CLOSE_REQ] = func(pkt *client.Packet) *client.Packet {
+		return nil
+	}
+
+	defer ps.Close()
+	defer s.Close()
+
+	tunnel := &grpcTunnel{
+		stream:      s,
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
+
+	go tunnel.serve(&fakeConn{})
+	go ts.serve()
+
+	conn, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
+	if err != nil {
+		t.Fatalf("expect nil; got %v", err)
+	}
+
+	go func() {
+		buf := make([]byte, 10)
+		_, err = conn.Read(buf)
+		if err != io.EOF {
+			t.Errorf("expected %v: got %v", io.EOF, err)
+		}
+	}()
+
+	if err := conn.Close(); err != errConnCloseTimeout {
+		t.Errorf("expected %v but got %v", errConnCloseTimeout, err)
+	}
+
+}
+
+func TestCreateSingleUseGrpcTunnel_NoLeakOnFailure(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	tunnel, err := CreateSingleUseGrpcTunnel(context.Background(), "127.0.0.1:12345", grpc.WithInsecure())
+	if tunnel != nil {
+		t.Fatal("expected nil tunnel when calling CreateSingleUseGrpcTunnel")
+	}
+	if err == nil {
+		t.Fatal("expected error when calling CreateSingleUseGrpcTunnel")
 	}
 }
 
