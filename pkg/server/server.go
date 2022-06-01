@@ -416,26 +416,32 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 		switch pkt.Type {
 		case client.PacketType_DIAL_REQ:
 			klog.V(5).Infoln("Received DIAL_REQ")
+			random := pkt.GetDialRequest().Random
 			// TODO: if we track what agent has historically served
 			// the address, then we can send the Dial_REQ to the
 			// same agent. That way we save the agent from creating
 			// a new connection to the address.
 			backend, err = s.getBackend(pkt.GetDialRequest().Address)
 			if err != nil {
-				klog.ErrorS(err, "Failed to get a backend", "serverID", s.serverID)
+				klog.ErrorS(err, "Failed to get a backend", "serverID", s.serverID, "dialID", random)
 
 				resp := &client.Packet{
-					Type:    client.PacketType_DIAL_RSP,
-					Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{Error: err.Error()}},
+					Type: client.PacketType_DIAL_RSP,
+					Payload: &client.Packet_DialResponse{
+						DialResponse: &client.DialResponse{
+							Random: random,
+							Error:  err.Error(),
+						},
+					},
 				}
 				if err := stream.Send(resp); err != nil {
-					klog.V(5).Infoln("Failed to send DIAL_RSP for no backend", "error", err, "serverID", s.serverID)
+					klog.V(5).InfoS("Failed to send DIAL_RSP for no backend", "error", err, "serverID", s.serverID, "dialID", random)
 				}
 				// The Dial is failing; no reason to keep this goroutine.
 				return
 			}
 			s.PendingDial.Add(
-				pkt.GetDialRequest().Random,
+				random,
 				&ProxyClientConnection{
 					Mode:      "grpc",
 					Grpc:      stream,
@@ -444,9 +450,10 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 					backend:   backend,
 				})
 			if err := backend.Send(pkt); err != nil {
-				klog.ErrorS(err, "DIAL_REQ to Backend failed", "serverID", s.serverID)
+				klog.ErrorS(err, "DIAL_REQ to Backend failed", "serverID", s.serverID, "dialID", random)
+			} else {
+				klog.V(5).InfoS("DIAL_REQ sent to backend", "serverID", s.serverID, "dialID", random)
 			}
-			klog.V(5).Infoln("DIAL_REQ sent to backend") // got this. but backend didn't receive anything.
 
 		case client.PacketType_CLOSE_REQ:
 			connID := pkt.GetCloseRequest().ConnectID
@@ -459,15 +466,16 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 			if err := backend.Send(pkt); err != nil {
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID, "connectionID", connID)
+			} else {
+				klog.V(5).InfoS("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
 			}
-			klog.V(5).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
 
 		case client.PacketType_DIAL_CLS:
 			random := pkt.GetCloseDial().Random
 			klog.V(5).InfoS("Received DIAL_CLOSE", "serverID", s.serverID, "dialID", random)
 			// Currently not worrying about backend as we do not have an established connection,
 			s.PendingDial.Remove(random)
-			klog.V(5).Infoln("Removing pending dial request", "serverID", s.serverID, "dialID", random)
+			klog.V(5).InfoS("Removing pending dial request", "serverID", s.serverID, "dialID", random)
 
 		case client.PacketType_DATA:
 			connID := pkt.GetData().ConnectID
@@ -714,7 +722,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 			klog.V(5).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 
 			if frontend, ok := s.PendingDial.Get(resp.Random); !ok {
-				klog.V(2).Infoln("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+				klog.V(2).InfoS("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
 				dialErr := false
 				if resp.Error != "" {
@@ -765,7 +773,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 				// Normal when frontend closes it.
 				klog.ErrorS(err, "CLOSE_RSP send to client stream error", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
-				klog.V(5).Infoln("CLOSE_RSP sent to frontend", "connectionID", resp.ConnectID)
+				klog.V(5).InfoS("CLOSE_RSP sent to frontend", "connectionID", resp.ConnectID)
 			}
 			s.removeFrontend(agentID, resp.ConnectID)
 			klog.V(5).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)

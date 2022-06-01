@@ -83,9 +83,17 @@ github.com/spf13/cobra
 # github.com/spf13/pflag v1.0.5
 ## explicit; go 1.12
 github.com/spf13/pflag
+# go.uber.org/goleak v1.1.10
+## explicit; go 1.13
+go.uber.org/goleak
+go.uber.org/goleak/internal/stack
 # golang.org/x/crypto v0.0.0-20201002170205-7f63de1d35b0
 ## explicit; go 1.11
 golang.org/x/crypto/ssh/terminal
+# golang.org/x/lint v0.0.0-20200302205851-738671d3881b
+## explicit; go 1.11
+golang.org/x/lint
+golang.org/x/lint/golint
 # golang.org/x/net v0.0.0-20201110031124-69a78807bb2b
 ## explicit; go 1.11
 golang.org/x/net/context
@@ -114,6 +122,11 @@ golang.org/x/text/unicode/norm
 # golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 ## explicit
 golang.org/x/time/rate
+# golang.org/x/tools v0.0.0-20210106214847-113979e3529a
+## explicit; go 1.12
+golang.org/x/tools/go/ast/astutil
+golang.org/x/tools/go/gcexportdata
+golang.org/x/tools/go/internal/gcimporter
 # google.golang.org/appengine v1.6.5
 ## explicit; go 1.11
 google.golang.org/appengine/internal
