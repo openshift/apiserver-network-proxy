@@ -1,21 +1,37 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package tests
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
-	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
+	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
 type simpleServer struct {
@@ -25,7 +41,7 @@ type simpleServer struct {
 // ServeHTTP blocks the response to the request whose body is "1" until a
 // request whose body is "2" is handled.
 func (s *simpleServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	bytes, err := ioutil.ReadAll(req.Body)
+	bytes, err := io.ReadAll(req.Body)
 	if err != nil {
 		w.Write([]byte(err.Error()))
 	}
@@ -51,7 +67,7 @@ func getTestClient(front string, t *testing.T) *http.Client {
 		Transport: &http.Transport{
 			DialContext: tunnel.DialContext,
 		},
-		Timeout: 2 * time.Second,
+		Timeout: wait.ForeverTestTimeout,
 	}
 }
 
@@ -62,14 +78,14 @@ type singleTimeManager struct {
 	used     map[string]struct{}
 }
 
-func (s *singleTimeManager) AddBackend(agentID string, _ pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) server.Backend {
+func (s *singleTimeManager) AddBackend(agentID string, _ header.IdentifierType, conn agent.AgentService_ConnectServer) server.Backend {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.backends[agentID] = conn
 	return conn
 }
 
-func (s *singleTimeManager) RemoveBackend(agentID string, _ pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) {
+func (s *singleTimeManager) RemoveBackend(agentID string, _ header.IdentifierType, conn agent.AgentService_ConnectServer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.backends[agentID]
@@ -129,8 +145,10 @@ func TestConcurrentClientRequest(t *testing.T) {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	// Run two agents
-	runAgent(proxy.agent, stopCh)
-	runAgent(proxy.agent, stopCh)
+	cs1 := runAgent(proxy.agent, stopCh)
+	cs2 := runAgent(proxy.agent, stopCh)
+	waitForConnectedServerCount(t, 1, cs1)
+	waitForConnectedServerCount(t, 1, cs2)
 
 	client1 := getTestClient(proxy.front, t)
 	client2 := getTestClient(proxy.front, t)
@@ -143,7 +161,7 @@ func TestConcurrentClientRequest(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		data, err := ioutil.ReadAll(r.Body)
+		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
 		}
@@ -153,8 +171,6 @@ func TestConcurrentClientRequest(t *testing.T) {
 			t.Errorf("expect %v; got %v", "1", string(data))
 		}
 	}()
-	// give client1 some time to establish the connection.
-	time.Sleep(1 * time.Second)
 	go func() {
 		defer wg.Done()
 		r, err := client2.Post(s.URL, "text/plain", bytes.NewBufferString("2"))
@@ -162,7 +178,7 @@ func TestConcurrentClientRequest(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		data, err := ioutil.ReadAll(r.Body)
+		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
 		}

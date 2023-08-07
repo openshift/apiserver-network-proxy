@@ -19,16 +19,19 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
+
+	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
-	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
+	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
 type ProxyStrategy string
@@ -69,6 +72,7 @@ func GenProxyStrategiesFromStr(proxyStrategies string) ([]ProxyStrategy, error) 
 
 type Backend interface {
 	Send(p *client.Packet) error
+	Recv() (*client.Packet, error)
 	Context() context.Context
 }
 
@@ -78,14 +82,38 @@ var _ Backend = agent.AgentService_ConnectServer(nil)
 type backend struct {
 	// TODO: this is a multi-writer single-reader pattern, it's tricky to
 	// write it using channel. Let's worry about performance later.
-	mu   sync.Mutex // mu protects conn
-	conn agent.AgentService_ConnectServer
+	sendLock sync.Mutex
+	recvLock sync.Mutex
+	conn     agent.AgentService_ConnectServer
 }
 
 func (b *backend) Send(p *client.Packet) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.conn.Send(p)
+	b.sendLock.Lock()
+	defer b.sendLock.Unlock()
+
+	const segment = commonmetrics.SegmentToAgent
+	metrics.Metrics.ObservePacket(segment, p.Type)
+	err := b.conn.Send(p)
+	if err != nil && err != io.EOF {
+		metrics.Metrics.ObserveStreamError(segment, err, p.Type)
+	}
+	return err
+}
+
+func (b *backend) Recv() (*client.Packet, error) {
+	b.recvLock.Lock()
+	defer b.recvLock.Unlock()
+
+	const segment = commonmetrics.SegmentFromAgent
+	pkt, err := b.conn.Recv()
+	if err != nil {
+		if err != io.EOF {
+			metrics.Metrics.ObserveStreamErrorNoPacket(segment, err)
+		}
+		return nil, err
+	}
+	metrics.Metrics.ObservePacket(segment, pkt.Type)
+	return pkt, nil
 }
 
 func (b *backend) Context() context.Context {
@@ -101,9 +129,9 @@ func newBackend(conn agent.AgentService_ConnectServer) *backend {
 // connections, i.e., get, add and remove
 type BackendStorage interface {
 	// AddBackend adds a backend.
-	AddBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) Backend
+	AddBackend(identifier string, idType header.IdentifierType, conn agent.AgentService_ConnectServer) Backend
 	// RemoveBackend removes a backend.
-	RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer)
+	RemoveBackend(identifier string, idType header.IdentifierType, conn agent.AgentService_ConnectServer)
 	// NumBackends returns the number of backends.
 	NumBackends() int
 }
@@ -154,18 +182,21 @@ type DefaultBackendStorage struct {
 	// types of identifiers when associating to a specific BackendManager,
 	// e.g., when associating to the DestHostBackendManager, it can only use the
 	// identifiers of types, IPv4, IPv6 and Host.
-	idTypes []pkgagent.IdentifierType
+	idTypes []header.IdentifierType
 }
 
 // NewDefaultBackendManager returns a DefaultBackendManager.
 func NewDefaultBackendManager() *DefaultBackendManager {
 	return &DefaultBackendManager{
 		DefaultBackendStorage: NewDefaultBackendStorage(
-			[]pkgagent.IdentifierType{pkgagent.UID})}
+			[]header.IdentifierType{header.UID})}
 }
 
 // NewDefaultBackendStorage returns a DefaultBackendStorage
-func NewDefaultBackendStorage(idTypes []pkgagent.IdentifierType) *DefaultBackendStorage {
+func NewDefaultBackendStorage(idTypes []header.IdentifierType) *DefaultBackendStorage {
+	// Set an explicit value, so that the metric is emitted even when
+	// no agent ever successfully connects.
+	metrics.Metrics.SetBackendCount(0)
 	return &DefaultBackendStorage{
 		backends: make(map[string][]*backend),
 		random:   rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -173,7 +204,7 @@ func NewDefaultBackendStorage(idTypes []pkgagent.IdentifierType) *DefaultBackend
 	} /* #nosec G404 */
 }
 
-func containIDType(idTypes []pkgagent.IdentifierType, idType pkgagent.IdentifierType) bool {
+func containIDType(idTypes []header.IdentifierType, idType header.IdentifierType) bool {
 	for _, it := range idTypes {
 		if it == idType {
 			return true
@@ -183,12 +214,12 @@ func containIDType(idTypes []pkgagent.IdentifierType, idType pkgagent.Identifier
 }
 
 // AddBackend adds a backend.
-func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) Backend {
+func (s *DefaultBackendStorage) AddBackend(identifier string, idType header.IdentifierType, conn agent.AgentService_ConnectServer) Backend {
 	if !containIDType(s.idTypes, idType) {
 		klog.V(4).InfoS("fail to add backend", "backend", identifier, "error", &ErrWrongIDType{idType, s.idTypes})
 		return nil
 	}
-	klog.V(2).InfoS("Register backend for agent", "connection", conn, "agentID", identifier)
+	klog.V(5).InfoS("Register backend for agent", "connection", conn, "agentID", identifier)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, ok := s.backends[identifier]
@@ -206,19 +237,19 @@ func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.Id
 	s.backends[identifier] = []*backend{addedBackend}
 	metrics.Metrics.SetBackendCount(len(s.backends))
 	s.agentIDs = append(s.agentIDs, identifier)
-	if idType == pkgagent.DefaultRoute {
+	if idType == header.DefaultRoute {
 		s.defaultRouteAgentIDs = append(s.defaultRouteAgentIDs, identifier)
 	}
 	return addedBackend
 }
 
 // RemoveBackend removes a backend.
-func (s *DefaultBackendStorage) RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) {
+func (s *DefaultBackendStorage) RemoveBackend(identifier string, idType header.IdentifierType, conn agent.AgentService_ConnectServer) {
 	if !containIDType(s.idTypes, idType) {
 		klog.ErrorS(&ErrWrongIDType{idType, s.idTypes}, "fail to remove backend")
 		return
 	}
-	klog.V(2).InfoS("Remove connection for agent", "connection", conn, "identifier", identifier)
+	klog.V(5).InfoS("Remove connection for agent", "connection", conn, "identifier", identifier)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	backends, ok := s.backends[identifier]
@@ -245,7 +276,7 @@ func (s *DefaultBackendStorage) RemoveBackend(identifier string, idType pkgagent
 				break
 			}
 		}
-		if idType == pkgagent.DefaultRoute {
+		if idType == header.DefaultRoute {
 			for i := range s.defaultRouteAgentIDs {
 				if s.defaultRouteAgentIDs[i] == identifier {
 					s.defaultRouteAgentIDs = append(s.defaultRouteAgentIDs[:i], s.defaultRouteAgentIDs[i+1:]...)
@@ -276,8 +307,8 @@ func (e *ErrNotFound) Error() string {
 }
 
 type ErrWrongIDType struct {
-	got    pkgagent.IdentifierType
-	expect []pkgagent.IdentifierType
+	got    header.IdentifierType
+	expect []header.IdentifierType
 }
 
 func (e *ErrWrongIDType) Error() string {
@@ -299,7 +330,7 @@ func (s *DefaultBackendStorage) GetRandomBackend() (Backend, error) {
 		return nil, &ErrNotFound{}
 	}
 	agentID := s.agentIDs[s.random.Intn(len(s.agentIDs))]
-	klog.V(4).InfoS("Pick agent as backend", "agentID", agentID)
+	klog.V(5).InfoS("Pick agent as backend", "agentID", agentID)
 	// always return the first connection to an agent, because the agent
 	// will close later connections if there are multiple.
 	return s.backends[agentID][0], nil

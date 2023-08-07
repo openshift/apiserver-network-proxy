@@ -1,13 +1,30 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package tests
 
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
+	"k8s.io/apimachinery/pkg/util/wait"
 	agentproto "sigs.k8s.io/apiserver-network-proxy/proto/agent"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
@@ -15,7 +32,7 @@ import (
 func TestClientReconnects(t *testing.T) {
 	connections := make(chan struct{})
 	s := &testAgentServerImpl{
-		onConnect: func(stream agent.AgentService_ConnectServer) error {
+		onConnect: func(stream agentproto.AgentService_ConnectServer) error {
 			stream.SetHeader(metadata.New(map[string]string{
 				header.ServerID:    uuid.Must(uuid.NewRandom()).String(),
 				header.ServerCount: "1",
@@ -32,14 +49,21 @@ func TestClientReconnects(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		svr.Serve(lis)
+		if err := svr.Serve(lis); err != nil {
+			panic(err)
+		}
 	}()
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	runAgentWithID("test-id", lis.Addr().String(), stopCh)
 
-	<-connections
+	select {
+	case <-connections:
+		// Expected
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("Timed out waiting for agent to connect")
+	}
 	svr.Stop()
 
 	lis2, err := net.Listen("tcp", lis.Addr().String())
@@ -53,14 +77,20 @@ func TestClientReconnects(t *testing.T) {
 			panic(err)
 		}
 	}()
+	defer svr2.Stop()
 
-	<-connections
+	select {
+	case <-connections:
+		// Expected
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("Timed out waiting for agent to reconnect")
+	}
 }
 
 type testAgentServerImpl struct {
-	onConnect func(agent.AgentService_ConnectServer) error
+	onConnect func(agentproto.AgentService_ConnectServer) error
 }
 
-func (t *testAgentServerImpl) Connect(svr agent.AgentService_ConnectServer) error {
+func (t *testAgentServerImpl) Connect(svr agentproto.AgentService_ConnectServer) error {
 	return t.onConnect(svr)
 }
