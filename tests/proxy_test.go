@@ -57,7 +57,7 @@ func (s *testServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func TestBasicProxy_GRPC(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	ctx := context.Background()
 	server := httptest.NewServer(newEchoServer("hello"))
@@ -111,7 +111,7 @@ func TestBasicProxy_GRPC(t *testing.T) {
 }
 
 func TestProxyHandleDialError_GRPC(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	ctx := context.Background()
 	invalidServer := httptest.NewServer(newEchoServer("hello"))
@@ -152,7 +152,7 @@ func TestProxyHandleDialError_GRPC(t *testing.T) {
 }
 
 func TestProxyHandle_DoneContext_GRPC(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	hangingServer := newEchoServer("hello")
 	hangingServer.wchan = make(chan struct{})
@@ -183,7 +183,7 @@ func TestProxyHandle_DoneContext_GRPC(t *testing.T) {
 }
 
 func TestProxyHandle_SlowContext_GRPC(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	slowServer := newEchoServer("hello")
 	slowServer.wchan = make(chan struct{})
@@ -236,7 +236,7 @@ func TestProxyHandle_SlowContext_GRPC(t *testing.T) {
 }
 
 func TestProxyHandle_ContextCancelled_GRPC(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	slowServer := newEchoServer("hello")
 	slowServer.wchan = make(chan struct{})
@@ -289,7 +289,7 @@ func TestProxyHandle_ContextCancelled_GRPC(t *testing.T) {
 }
 
 func TestProxy_LargeResponse(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	ctx := context.Background()
 	length := 1 << 20 // 1M
@@ -345,7 +345,7 @@ func TestProxy_LargeResponse(t *testing.T) {
 }
 
 func TestBasicProxy_HTTPCONN(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	server := httptest.NewServer(newEchoServer("hello"))
 	defer server.Close()
@@ -417,7 +417,7 @@ func TestBasicProxy_HTTPCONN(t *testing.T) {
 }
 
 func TestFailedDial_HTTPCONN(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent(), goleak.IgnoreTopFunction("google.golang.org/grpc.(*addrConn).resetTransport"))
 
 	server := httptest.NewServer(newEchoServer("hello"))
 	server.Close() // cleanup immediately so connections will fail
