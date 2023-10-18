@@ -5,3 +5,16 @@
 /easy-rsa-master/
 /easy-rsa.tar.gz
 /easy-rsa
+
+# editor and IDE paraphernalia
+.idea
+.vscode
+
+# macOS paraphernalia
+.DS_Store
+
+# coverage files
+konnectivity.out
+konnectivity.html
+konnectivity-client/client.out
+konnectivity-client/client.html
