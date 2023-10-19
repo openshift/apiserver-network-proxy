@@ -1,5 +1,5 @@
 # Build the http test server binary
-FROM golang:1.17.8 as builder
+FROM golang:1.19.13 as builder
 
 # Copy in the go src
 WORKDIR /go/src/sigs.k8s.io/apiserver-network-proxy
@@ -26,7 +26,7 @@ ARG ARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} go build -v -a -ldflags '-extldflags "-static"' -o http-test-server sigs.k8s.io/apiserver-network-proxy/cmd/test-server
 
 # Copy the loader into a thin image
-FROM scratch
+FROM gcr.io/distroless/static-debian11
 WORKDIR /
 COPY --from=builder /go/src/sigs.k8s.io/apiserver-network-proxy/http-test-server .
 ENTRYPOINT ["/http-test-server"]
