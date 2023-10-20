@@ -20,17 +20,15 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-
-	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
-	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 )
 
 const (
-	Namespace = "konnectivity_network_proxy"
-	Subsystem = "server"
+	namespace = "konnectivity_network_proxy"
+	subsystem = "server"
 
 	// Proxy is the ProxyService method used to handle incoming streams.
 	Proxy = "Proxy"
+
 	// Connect is the AgentService method used to establish next hop.
 	Connect = "Connect"
 )
@@ -45,25 +43,20 @@ var (
 
 // ServerMetrics includes all the metrics of the proxy server.
 type ServerMetrics struct {
-	endpointLatencies *prometheus.HistogramVec
+	latencies         *prometheus.HistogramVec
 	frontendLatencies *prometheus.HistogramVec
-	grpcConnections   *prometheus.GaugeVec
+	connections       *prometheus.GaugeVec
 	httpConnections   prometheus.Gauge
 	backend           *prometheus.GaugeVec
 	pendingDials      *prometheus.GaugeVec
-	establishedConns  *prometheus.GaugeVec
-	fullRecvChannels  *prometheus.GaugeVec
-	dialFailures      *prometheus.CounterVec
-	streamPackets     *prometheus.CounterVec
-	streamErrors      *prometheus.CounterVec
 }
 
 // newServerMetrics create a new ServerMetrics, configured with default metric names.
 func newServerMetrics() *ServerMetrics {
-	endpointLatencies := prometheus.NewHistogramVec(
+	latencies := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "dial_duration_seconds",
 			Help:      "Latency of dial to the remote endpoint in seconds",
 			Buckets:   latencyBuckets,
@@ -72,18 +65,18 @@ func newServerMetrics() *ServerMetrics {
 	)
 	frontendLatencies := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "frontend_write_duration_seconds",
 			Help:      "Latency of write to the frontend in seconds",
 			Buckets:   latencyBuckets,
 		},
 		[]string{},
 	)
-	grpcConnections := prometheus.NewGaugeVec(
+	connections := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "grpc_connections",
 			Help:      "Number of current grpc connections, partitioned by service method.",
 		},
@@ -93,16 +86,16 @@ func newServerMetrics() *ServerMetrics {
 	)
 	httpConnections := prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "http_connections",
 			Help:      "Number of current HTTP CONNECT connections",
 		},
 	)
 	backend := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "ready_backend_connections",
 			Help:      "Number of konnectivity agent connected to the proxy server",
 		},
@@ -110,155 +103,68 @@ func newServerMetrics() *ServerMetrics {
 	)
 	pendingDials := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "pending_backend_dials",
 			Help:      "Current number of pending backend dial requests",
 		},
 		[]string{},
 	)
-	establishedConns := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
-			Name:      "established_connections",
-			Help:      "Current number of established end-to-end connections (post-dial).",
-		},
-		[]string{},
-	)
-	fullRecvChannels := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
-			Name:      "full_receive_channels",
-			Help:      "Number of current connections blocked by a full receive channel, partitioned by service method.",
-		},
-		[]string{
-			"service_method",
-		},
-	)
-	dialFailures := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: Namespace,
-			Subsystem: Subsystem,
-			Name:      "dial_failure_count",
-			Help:      "Number of dial failures observed. Multiple failures can occur for a single dial request.",
-		},
-		[]string{
-			"reason",
-		},
-	)
-	streamPackets := commonmetrics.MakeStreamPacketsTotalMetric(Namespace, Subsystem)
-	streamErrors := commonmetrics.MakeStreamErrorsTotalMetric(Namespace, Subsystem)
-	prometheus.MustRegister(endpointLatencies)
+
+	prometheus.MustRegister(latencies)
 	prometheus.MustRegister(frontendLatencies)
-	prometheus.MustRegister(grpcConnections)
+	prometheus.MustRegister(connections)
 	prometheus.MustRegister(httpConnections)
 	prometheus.MustRegister(backend)
 	prometheus.MustRegister(pendingDials)
-	prometheus.MustRegister(establishedConns)
-	prometheus.MustRegister(fullRecvChannels)
-	prometheus.MustRegister(dialFailures)
-	prometheus.MustRegister(streamPackets)
-	prometheus.MustRegister(streamErrors)
 	return &ServerMetrics{
-		endpointLatencies: endpointLatencies,
+		latencies:         latencies,
 		frontendLatencies: frontendLatencies,
-		grpcConnections:   grpcConnections,
+		connections:       connections,
 		httpConnections:   httpConnections,
 		backend:           backend,
 		pendingDials:      pendingDials,
-		establishedConns:  establishedConns,
-		fullRecvChannels:  fullRecvChannels,
-		dialFailures:      dialFailures,
-		streamPackets:     streamPackets,
-		streamErrors:      streamErrors,
 	}
 }
 
 // Reset resets the metrics.
-func (s *ServerMetrics) Reset() {
-	s.endpointLatencies.Reset()
-	s.frontendLatencies.Reset()
-	s.grpcConnections.Reset()
-	s.backend.Reset()
-	s.pendingDials.Reset()
-	s.establishedConns.Reset()
-	s.fullRecvChannels.Reset()
-	s.dialFailures.Reset()
-	s.streamPackets.Reset()
-	s.streamErrors.Reset()
+func (a *ServerMetrics) Reset() {
+	a.latencies.Reset()
+	a.frontendLatencies.Reset()
 }
 
 // ObserveDialLatency records the latency of dial to the remote endpoint.
-func (s *ServerMetrics) ObserveDialLatency(elapsed time.Duration) {
-	s.endpointLatencies.WithLabelValues().Observe(elapsed.Seconds())
+func (a *ServerMetrics) ObserveDialLatency(elapsed time.Duration) {
+	a.latencies.WithLabelValues().Observe(elapsed.Seconds())
 }
 
-// ObserveFrontendWriteLatency records the latency of blocking on stream send to the client.
-func (s *ServerMetrics) ObserveFrontendWriteLatency(elapsed time.Duration) {
-	s.frontendLatencies.WithLabelValues().Observe(elapsed.Seconds())
+// ObserveFrontendWriteLatency records the latency of dial to the remote endpoint.
+func (a *ServerMetrics) ObserveFrontendWriteLatency(elapsed time.Duration) {
+	a.frontendLatencies.WithLabelValues().Observe(elapsed.Seconds())
 }
 
 // ConnectionInc increments a new grpc client connection.
-func (s *ServerMetrics) ConnectionInc(serviceMethod string) {
-	s.grpcConnections.With(prometheus.Labels{"service_method": serviceMethod}).Inc()
+func (a *ServerMetrics) ConnectionInc(serviceMethod string) {
+	a.connections.With(prometheus.Labels{"service_method": serviceMethod}).Inc()
 }
 
 // ConnectionDec decrements a finished grpc client connection.
-func (s *ServerMetrics) ConnectionDec(serviceMethod string) {
-	s.grpcConnections.With(prometheus.Labels{"service_method": serviceMethod}).Dec()
+func (a *ServerMetrics) ConnectionDec(serviceMethod string) {
+	a.connections.With(prometheus.Labels{"service_method": serviceMethod}).Dec()
 }
 
 // HTTPConnectionDec increments a new HTTP CONNECTION connection.
-func (s *ServerMetrics) HTTPConnectionInc() { s.httpConnections.Inc() }
+func (a *ServerMetrics) HTTPConnectionInc() { a.httpConnections.Inc() }
 
 // HTTPConnectionDec decrements a finished HTTP CONNECTION connection.
-func (s *ServerMetrics) HTTPConnectionDec() { s.httpConnections.Dec() }
+func (a *ServerMetrics) HTTPConnectionDec() { a.httpConnections.Dec() }
 
 // SetBackendCount sets the number of backend connection.
-func (s *ServerMetrics) SetBackendCount(count int) {
-	s.backend.WithLabelValues().Set(float64(count))
+func (a *ServerMetrics) SetBackendCount(count int) {
+	a.backend.WithLabelValues().Set(float64(count))
 }
 
 // SetPendingDialCount sets the number of pending dials.
-func (s *ServerMetrics) SetPendingDialCount(count int) {
-	s.pendingDials.WithLabelValues().Set(float64(count))
-}
-
-// SetEstablishedConnCount sets the number of established connections.
-func (s *ServerMetrics) SetEstablishedConnCount(count int) {
-	s.establishedConns.WithLabelValues().Set(float64(count))
-}
-
-// FullRecvChannel retrieves the metric for counting full receive channels.
-func (s *ServerMetrics) FullRecvChannel(serviceMethod string) prometheus.Gauge {
-	return s.fullRecvChannels.With(prometheus.Labels{"service_method": serviceMethod})
-}
-
-type DialFailureReason string
-
-const (
-	DialFailureNoAgent              DialFailureReason = "no_agent"              // No available agent is connected.
-	DialFailureErrorResponse        DialFailureReason = "error_response"        // Dial failure reported by the agent back to the server.
-	DialFailureUnrecognizedResponse DialFailureReason = "unrecognized_response" // Dial repsonse received for unrecognozide dial ID.
-	DialFailureSendResponse         DialFailureReason = "send_rsp"              // Successful dial response from agent, but failed to send to frontend.
-	DialFailureBackendClose         DialFailureReason = "backend_close"         // Received a DIAL_CLS from the backend before the dial completed.
-	DialFailureFrontendClose        DialFailureReason = "frontend_close"        // Received a DIAL_CLS from the frontend before the dial completed.
-)
-
-func (s *ServerMetrics) ObserveDialFailure(reason DialFailureReason) {
-	s.dialFailures.With(prometheus.Labels{"reason": string(reason)}).Inc()
-}
-
-func (s *ServerMetrics) ObservePacket(segment commonmetrics.Segment, packetType client.PacketType) {
-	commonmetrics.ObservePacket(s.streamPackets, segment, packetType)
-}
-
-func (s *ServerMetrics) ObserveStreamErrorNoPacket(segment commonmetrics.Segment, err error) {
-	commonmetrics.ObserveStreamErrorNoPacket(s.streamErrors, segment, err)
-}
-
-func (s *ServerMetrics) ObserveStreamError(segment commonmetrics.Segment, err error, packetType client.PacketType) {
-	commonmetrics.ObserveStreamError(s.streamErrors, segment, err, packetType)
+func (a *ServerMetrics) SetPendingDialCount(count int) {
+	a.pendingDials.WithLabelValues().Set(float64(count))
 }

@@ -20,32 +20,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client/metrics"
-	metricstest "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics/testing"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 )
 
-func TestMain(m *testing.M) {
-	fs := flag.NewFlagSet("test", flag.PanicOnError)
-	klog.InitFlags(fs)
-	fs.Set("v", "9")
-	metrics.Metrics.RegisterMetrics(prometheus.DefaultRegisterer)
-
-	m.Run()
-}
-
 func TestDial(t *testing.T) {
-	expectCleanShutdown(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	ctx := context.Background()
 	s, ps := pipe()
@@ -54,13 +40,13 @@ func TestDial(t *testing.T) {
 	defer ps.Close()
 	defer s.Close()
 
-	tunnel := newUnstartedTunnel(s, s.conn())
-
-	if err := metricstest.ExpectClientConnection(metrics.ClientConnectionStatusCreated, 1); err != nil {
-		t.Error(err)
+	tunnel := &grpcTunnel{
+		stream:      s,
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
 	}
 
-	go tunnel.serve(ctx)
+	go tunnel.serve(&fakeConn{})
 	go ts.serve()
 
 	_, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
@@ -75,24 +61,12 @@ func TestDial(t *testing.T) {
 	if ts.packets[0].GetDialRequest().Address != "127.0.0.1:80" {
 		t.Errorf("expect packet.address %v; got %v", "127.0.0.1:80", ts.packets[0].GetDialRequest().Address)
 	}
-
-	if err := metricstest.ExpectClientConnections(map[metrics.ClientConnectionStatus]int{
-		metrics.ClientConnectionStatusCreated: 0,
-		metrics.ClientConnectionStatusDialing: 0,
-		metrics.ClientConnectionStatusOk:      1,
-	}); err != nil {
-		t.Error(err)
-	}
-	if err := metricstest.ExpectClientDialFailures(nil); err != nil {
-		t.Error(err)
-	}
-	metrics.Metrics.Reset() // For clean shutdown.
 }
 
 // TestDialRace exercises the scenario where serve() observes and handles DIAL_RSP
 // before DialContext() does any work after sending the DIAL_REQ.
 func TestDialRace(t *testing.T) {
-	expectCleanShutdown(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	ctx := context.Background()
 	s, ps := pipe()
@@ -101,11 +75,14 @@ func TestDialRace(t *testing.T) {
 	defer ps.Close()
 	defer s.Close()
 
-	// artificially delay after calling Send, ensure handoff of result from serve to DialContext still works
-	slowStream := fakeSlowSend{s}
-	tunnel := newUnstartedTunnel(slowStream, &fakeConn{})
+	tunnel := &grpcTunnel{
+		// artificially delay after calling Send, ensure handoff of result from serve to DialContext still works
+		stream:      fakeSlowSend{s},
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
 
-	go tunnel.serve(ctx)
+	go tunnel.serve(&fakeConn{})
 	go ts.serve()
 
 	_, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
@@ -119,10 +96,6 @@ func TestDialRace(t *testing.T) {
 
 	if ts.packets[0].GetDialRequest().Address != "127.0.0.1:80" {
 		t.Errorf("expect packet.address %v; got %v", "127.0.0.1:80", ts.packets[0].GetDialRequest().Address)
-	}
-
-	if err := metricstest.ExpectClientDialFailures(nil); err != nil {
-		t.Error(err)
 	}
 }
 
@@ -141,42 +114,8 @@ func (s fakeSlowSend) Send(p *client.Packet) error {
 	return err
 }
 
-func TestAlreadyDialed(t *testing.T) {
-	expectCleanShutdown(t)
-
-	ctx := context.Background()
-	s, ps := pipe()
-	ts := testServer(ps, 100)
-
-	defer ps.Close()
-	defer s.Close()
-
-	// artificially delay after calling Send, ensure handoff of result from serve to DialContext still works
-	slowStream := fakeSlowSend{s}
-	tunnel := newUnstartedTunnel(slowStream, &fakeConn{})
-
-	go tunnel.serve(ctx)
-	go ts.serve()
-
-	_, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
-	if err != nil {
-		t.Fatalf("expect nil; got %v", err)
-	}
-
-	// Duplicate
-	_, err = tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
-	if err == nil {
-		t.Fatalf("expect duplicate dial error, got nil")
-	}
-
-	if err := metricstest.ExpectClientDialFailure(metrics.DialFailureAlreadyStarted, 1); err != nil {
-		t.Error(err)
-	}
-	metrics.Metrics.Reset() // For clean shutdown.
-}
-
 func TestData(t *testing.T) {
-	expectCleanShutdown(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	ctx := context.Background()
 	s, ps := pipe()
@@ -185,9 +124,13 @@ func TestData(t *testing.T) {
 	defer ps.Close()
 	defer s.Close()
 
-	tunnel := newUnstartedTunnel(s, s.conn())
+	tunnel := &grpcTunnel{
+		stream:      s,
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
 
-	go tunnel.serve(ctx)
+	go tunnel.serve(&fakeConn{})
 	go ts.serve()
 
 	conn, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
@@ -232,7 +175,7 @@ func TestData(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	expectCleanShutdown(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	ctx := context.Background()
 	s, ps := pipe()
@@ -241,22 +184,18 @@ func TestClose(t *testing.T) {
 	defer ps.Close()
 	defer s.Close()
 
-	tunnel := newUnstartedTunnel(s, s.conn())
+	tunnel := &grpcTunnel{
+		stream:      s,
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
 
-	go tunnel.serve(ctx)
+	go tunnel.serve(&fakeConn{})
 	go ts.serve()
 
 	conn, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
 	if err != nil {
 		t.Fatalf("expect nil; got %v", err)
-	}
-
-	if err := metricstest.ExpectClientConnections(map[metrics.ClientConnectionStatus]int{
-		metrics.ClientConnectionStatusCreated: 0,
-		metrics.ClientConnectionStatusDialing: 0,
-		metrics.ClientConnectionStatusOk:      1,
-	}); err != nil {
-		t.Error(err)
 	}
 
 	if err := conn.Close(); err != nil {
@@ -269,23 +208,10 @@ func TestClose(t *testing.T) {
 	if ts.packets[1].GetCloseRequest().ConnectID != 100 {
 		t.Errorf("expect connectID=100; got %d", ts.packets[1].GetCloseRequest().ConnectID)
 	}
-
-	<-tunnel.Done()
-	if err := metricstest.ExpectClientConnections(map[metrics.ClientConnectionStatus]int{
-		metrics.ClientConnectionStatusCreated: 0,
-		metrics.ClientConnectionStatusDialing: 0,
-		metrics.ClientConnectionStatusOk:      0,
-	}); err != nil {
-		t.Error(err)
-	}
-	metrics.Metrics.Reset() // For clean shutdown.
 }
 
 func TestCloseTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip()
-	}
-	expectCleanShutdown(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	ctx := context.Background()
 	s, ps := pipe()
@@ -300,9 +226,13 @@ func TestCloseTimeout(t *testing.T) {
 	defer ps.Close()
 	defer s.Close()
 
-	tunnel := newUnstartedTunnel(s, s.conn())
+	tunnel := &grpcTunnel{
+		stream:      s,
+		pendingDial: make(map[int64]pendingDial),
+		conns:       make(map[int64]*conn),
+	}
 
-	go tunnel.serve(ctx)
+	go tunnel.serve(&fakeConn{})
 	go ts.serve()
 
 	conn, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
@@ -322,15 +252,6 @@ func TestCloseTimeout(t *testing.T) {
 		t.Errorf("expected %v but got %v", errConnCloseTimeout, err)
 	}
 
-	<-tunnel.Done()
-	if err := metricstest.ExpectClientConnections(map[metrics.ClientConnectionStatus]int{
-		metrics.ClientConnectionStatusCreated: 0,
-		metrics.ClientConnectionStatusDialing: 0,
-		metrics.ClientConnectionStatusOk:      0,
-	}); err != nil {
-		t.Error(err)
-	}
-	metrics.Metrics.Reset() // For clean shutdown.
 }
 
 func TestCreateSingleUseGrpcTunnel_NoLeakOnFailure(t *testing.T) {
@@ -345,236 +266,19 @@ func TestCreateSingleUseGrpcTunnel_NoLeakOnFailure(t *testing.T) {
 	}
 }
 
-func TestCreateSingleUseGrpcTunnelWithContext_NoLeakOnFailure(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-
-	tunnel, err := CreateSingleUseGrpcTunnelWithContext(context.Background(), context.Background(), "127.0.0.1:12345", grpc.WithInsecure())
-	if tunnel != nil {
-		t.Fatal("expected nil tunnel when calling CreateSingleUseGrpcTunnelWithContext")
-	}
-	if err == nil {
-		t.Fatal("expected error when calling CreateSingleUseGrpcTunnelWithContext")
-	}
-}
-
-func TestDialAfterTunnelCancelled(t *testing.T) {
-	expectCleanShutdown(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	s, ps := pipeWithContext(ctx)
-	ts := testServer(ps, 100)
-
-	defer ps.Close()
-	defer s.Close()
-
-	tunnel := newUnstartedTunnel(s, s.conn())
-
-	go tunnel.serve(ctx)
-	go ts.serve()
-
-	_, err := tunnel.DialContext(ctx, "tcp", "127.0.0.1:80")
-	if err == nil {
-		t.Fatalf("expect err when dialing after tunnel closed")
-	}
-
-	// TODO(jkh52): verify dial failure metric.
-	metrics.Metrics.Reset() // For clean shutdown.
-
-	select {
-	case <-tunnel.Done():
-	case <-time.After(30 * time.Second):
-		t.Errorf("Timed out waiting for tunnel to close")
-	}
-}
-
-func TestDial_RequestContextCancelled(t *testing.T) {
-	expectCleanShutdown(t)
-
-	s, ps := pipe()
-	defer ps.Close()
-	defer s.Close()
-
-	ts := testServer(ps, 100)
-	reqCtx, reqCancel := context.WithCancel(context.Background())
-	ts.handlers[client.PacketType_DIAL_REQ] = func(*client.Packet) *client.Packet {
-		reqCancel()
-		return nil // don't respond
-	}
-	closeCh := make(chan struct{})
-	ts.handlers[client.PacketType_DIAL_CLS] = func(*client.Packet) *client.Packet {
-		close(closeCh)
-		return nil // don't respond
-	}
-	go ts.serve()
-
-	func() {
-		tunnel := newUnstartedTunnel(s, s.conn())
-		go tunnel.serve(context.Background())
-
-		_, err := tunnel.DialContext(reqCtx, "tcp", "127.0.0.1:80")
-		if err == nil {
-			t.Fatalf("Expected dial error, got none")
-		}
-
-		isDialFailure, reason := GetDialFailureReason(err)
-		if !isDialFailure {
-			t.Errorf("Unexpected non-dial failure error: %v", err)
-		} else if reason != metrics.DialFailureContext {
-			t.Errorf("Expected DialFailureContext, got %v", reason)
-		}
-
-		if err := metricstest.ExpectClientDialFailure(metrics.DialFailureContext, 1); err != nil {
-			t.Error(err)
-		}
-		metrics.Metrics.Reset() // For clean shutdown.
-
-		ts.assertPacketType(0, client.PacketType_DIAL_REQ)
-		waitForDialClsStart := time.Now()
-		select {
-		case <-closeCh:
-			t.Logf("Dial closed after %#v", time.Since(waitForDialClsStart).String())
-			ts.assertPacketType(1, client.PacketType_DIAL_CLS)
-		case <-time.After(30 * time.Second):
-			t.Fatal("Timed out waiting for DIAL_CLS packet")
-		}
-
-		waitForTunnelCloseStart := time.Now()
-		select {
-		case <-tunnel.Done():
-			t.Logf("Tunnel closed after %#v", time.Since(waitForTunnelCloseStart).String())
-		case <-time.After(30 * time.Second):
-			t.Errorf("Timed out waiting for tunnel to close")
-		}
-	}()
-}
-
-func TestDial_BackendError(t *testing.T) {
-	expectCleanShutdown(t)
-
-	s, ps := pipe()
-	ts := testServer(ps, 100)
-	ts.handlers[client.PacketType_DIAL_REQ] = func(pkt *client.Packet) *client.Packet {
-		return &client.Packet{
-			Type: client.PacketType_DIAL_RSP,
-			Payload: &client.Packet_DialResponse{
-				DialResponse: &client.DialResponse{
-					Random: pkt.GetDialRequest().Random,
-					Error:  "fake backend error",
-				},
-			},
-		}
-	}
-
-	defer ps.Close()
-	defer s.Close()
-
-	tunnel := newUnstartedTunnel(s, s.conn())
-
-	go tunnel.serve(context.Background())
-	go ts.serve()
-
-	_, err := tunnel.DialContext(context.Background(), "tcp", "127.0.0.1:80")
-	if err == nil {
-		t.Fatalf("Expected dial error, got none")
-	}
-
-	isDialFailure, reason := GetDialFailureReason(err)
-	if !isDialFailure {
-		t.Errorf("Unexpected non-dial failure error: %v", err)
-	} else if reason != metrics.DialFailureEndpoint {
-		t.Errorf("Expected DialFailureEndpoint, got %v", reason)
-	}
-
-	ts.assertPacketType(0, client.PacketType_DIAL_REQ)
-
-	if err := metricstest.ExpectClientDialFailure(metrics.DialFailureEndpoint, 1); err != nil {
-		t.Error(err)
-	}
-	metrics.Metrics.Reset() // For clean shutdown.
-}
-
-func TestDial_Closed(t *testing.T) {
-	expectCleanShutdown(t)
-
-	s, ps := pipe()
-	defer ps.Close()
-	defer s.Close()
-
-	ts := testServer(ps, 100)
-	ts.handlers[client.PacketType_DIAL_REQ] = func(pkt *client.Packet) *client.Packet {
-		return &client.Packet{
-			Type: client.PacketType_DIAL_CLS,
-			Payload: &client.Packet_CloseDial{
-				CloseDial: &client.CloseDial{
-					Random: pkt.GetDialRequest().Random,
-				},
-			},
-		}
-	}
-	go ts.serve()
-
-	func() {
-		// Verify that the tunnel goroutines are not leaked before cleaning up the test server.
-		goleak.VerifyNone(t, goleak.IgnoreCurrent())
-
-		tunnel := newUnstartedTunnel(s, s.conn())
-		go tunnel.serve(context.Background())
-
-		_, err := tunnel.DialContext(context.Background(), "tcp", "127.0.0.1:80")
-		if err == nil {
-			t.Fatalf("Expected dial error, got none")
-		}
-
-		isDialFailure, reason := GetDialFailureReason(err)
-		if !isDialFailure {
-			t.Errorf("Unexpected non-dial failure error: %v", err)
-		} else if reason != metrics.DialFailureDialClosed {
-			t.Errorf("Expected DialFailureDialClosed, got %v", reason)
-		}
-
-		ts.assertPacketType(0, client.PacketType_DIAL_REQ)
-
-		if err := metricstest.ExpectClientDialFailure(metrics.DialFailureDialClosed, 1); err != nil {
-			t.Error(err)
-		}
-		metrics.Metrics.Reset() // For clean shutdown.
-
-		select {
-		case <-tunnel.Done():
-		case <-time.After(30 * time.Second):
-			t.Errorf("Timed out waiting for tunnel to close")
-		}
-	}()
-}
-
-func TestRegisterMetrics(t *testing.T) {
-	Metrics.RegisterMetrics(prometheus.DefaultRegisterer)
-}
-
-func TestLegacyRegisterMetrics(t *testing.T) {
-	Metrics.LegacyRegisterMetrics(prometheus.MustRegister)
-}
-
 // TODO: Move to common testing library
 
 // fakeStream implements ProxyService_ProxyClient
 type fakeStream struct {
 	grpc.ClientStream
-	r      <-chan *client.Packet
-	w      chan<- *client.Packet
-	done   <-chan struct{}
-	closed chan struct{}
+	r <-chan *client.Packet
+	w chan<- *client.Packet
 }
 
 type fakeConn struct {
-	stream *fakeStream
 }
 
 func (f *fakeConn) Close() error {
-	if f.stream != nil {
-		f.stream.Close()
-	}
 	return nil
 }
 
@@ -583,13 +287,8 @@ var _ clientConn = &fakeConn{}
 var _ client.ProxyService_ProxyClient = &fakeStream{}
 
 func pipe() (*fakeStream, *fakeStream) {
-	return pipeWithContext(context.Background())
-}
-
-func pipeWithContext(context context.Context) (*fakeStream, *fakeStream) {
 	r, w := make(chan *client.Packet, 2), make(chan *client.Packet, 2)
-	s1 := &fakeStream{done: context.Done(), closed: make(chan struct{})}
-	s2 := &fakeStream{done: context.Done(), closed: make(chan struct{})}
+	s1, s2 := &fakeStream{}, &fakeStream{}
 	s1.r, s1.w = r, w
 	s2.r, s2.w = w, r
 	return s1, s2
@@ -600,40 +299,22 @@ func (s *fakeStream) Send(packet *client.Packet) error {
 	if packet == nil {
 		return nil
 	}
-	select {
-	case <-s.done:
-		return errors.New("Send on cancelled stream")
-	case <-s.closed:
-		return errors.New("Send on closed stream")
-	case s.w <- packet:
-		return nil
-	}
+	s.w <- packet
+	return nil
 }
 
 func (s *fakeStream) Recv() (*client.Packet, error) {
 	select {
-	case <-s.done:
-		return nil, errors.New("Recv on cancelled stream")
-	case <-s.closed:
-		return nil, errors.New("Recv on closed stream")
 	case pkt := <-s.r:
 		klog.V(4).InfoS("[DEBUG] recv", "packet", pkt)
 		return pkt, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Second):
 		return nil, errors.New("timeout recv")
 	}
 }
 
 func (s *fakeStream) Close() {
-	select {
-	case <-s.closed: // Avoid double-closing
-	default:
-		close(s.closed)
-	}
-}
-
-func (s *fakeStream) conn() *fakeConn {
-	return &fakeConn{s}
+	close(s.w)
 }
 
 type proxyServer struct {
@@ -642,9 +323,7 @@ type proxyServer struct {
 	handlers map[client.PacketType]handler
 	connid   int64
 	data     bytes.Buffer
-
-	packets     []*client.Packet
-	packetsLock sync.Mutex
+	packets  []*client.Packet
 }
 
 func testServer(s client.ProxyService_ProxyClient, connid int64) *proxyServer {
@@ -674,39 +353,24 @@ func (s *proxyServer) serve() {
 			return
 		}
 
-		func() {
-			s.packetsLock.Lock()
-			defer s.packetsLock.Unlock()
-			s.packets = append(s.packets, pkt)
-		}()
-
 		if handler, ok := s.handlers[pkt.Type]; ok {
-			req := handler(pkt)
-			if req != nil {
-				if err := s.s.Send(req); err != nil {
-					s.t.Error(err)
-				}
+			if err := s.s.Send(handler(pkt)); err != nil {
+				s.t.Error(err)
 			}
 		}
 	}
+
 }
 
-func (s *proxyServer) assertPacketType(index int, expectedType client.PacketType) {
-	s.packetsLock.Lock()
-	defer s.packetsLock.Unlock()
-
-	if index >= len(s.packets) {
-		s.t.Fatalf("Expected %v packet[%d], but have only received %d packets", expectedType, index, len(s.packets))
-	}
-	actual := s.packets[index].Type
-	if actual != expectedType {
-		s.t.Errorf("Unexpected packet[%d].type: got %v, expected %v", index, actual, expectedType)
-	}
+func (s *proxyServer) handle(t client.PacketType, h handler) *proxyServer {
+	s.handlers[t] = h
+	return s
 }
 
 type handler func(pkt *client.Packet) *client.Packet
 
 func (s *proxyServer) handleDial(pkt *client.Packet) *client.Packet {
+	s.packets = append(s.packets, pkt)
 	return &client.Packet{
 		Type: client.PacketType_DIAL_RSP,
 		Payload: &client.Packet_DialResponse{
@@ -719,6 +383,7 @@ func (s *proxyServer) handleDial(pkt *client.Packet) *client.Packet {
 }
 
 func (s *proxyServer) handleClose(pkt *client.Packet) *client.Packet {
+	s.packets = append(s.packets, pkt)
 	return &client.Packet{
 		Type: client.PacketType_CLOSE_RSP,
 		Payload: &client.Packet_CloseResponse{
@@ -730,6 +395,7 @@ func (s *proxyServer) handleClose(pkt *client.Packet) *client.Packet {
 }
 
 func (s *proxyServer) handleData(pkt *client.Packet) *client.Packet {
+	s.packets = append(s.packets, pkt)
 	s.data.Write(pkt.GetData().Data)
 
 	return &client.Packet{
@@ -741,23 +407,4 @@ func (s *proxyServer) handleData(pkt *client.Packet) *client.Packet {
 			},
 		},
 	}
-}
-
-func assertNoClientDialFailures(t testing.TB) {
-	t.Helper()
-	if err := metricstest.ExpectClientDialFailures(nil); err != nil {
-		t.Errorf("Unexpected %s metric: %v", "dial_failure_total", err)
-	}
-}
-
-func expectCleanShutdown(t testing.TB) {
-	metrics.Metrics.Reset()
-	currentGoRoutines := goleak.IgnoreCurrent()
-	t.Cleanup(func() {
-		goleak.VerifyNone(t, currentGoRoutines)
-		assertNoClientDialFailures(t)
-		// The tunnels gauge metric is intentionally not included here, to avoid
-		// brittle gauge assertions. Tests should directly verify it.
-		metrics.Metrics.Reset()
-	})
 }

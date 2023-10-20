@@ -1,26 +1,10 @@
-/*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package tests
 
 import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,14 +14,14 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
-	"sigs.k8s.io/apiserver-network-proxy/tests/framework"
 )
 
-func TestProxy_Agent_Disconnect_Persistent_Connection(t *testing.T) {
+func TestProxy_Agent_Disconnect_HTTP_Persistent_Connection(t *testing.T) {
 	testcases := []struct {
 		name                string
-		proxyServerFunction func(t testing.TB) framework.ProxyServer
+		proxyServerFunction func() (proxy, func(), error)
 		clientFunction      func(context.Context, string, string) (*http.Client, error)
 	}{
 		{
@@ -58,17 +42,28 @@ func TestProxy_Agent_Disconnect_Persistent_Connection(t *testing.T) {
 			server := httptest.NewServer(newEchoServer("hello"))
 			defer server.Close()
 
-			ps := tc.proxyServerFunction(t)
-			defer ps.Stop()
+			stopCh := make(chan struct{})
 
-			a := runAgent(t, ps.AgentAddr())
-			waitForConnectedAgentCount(t, 1, ps)
+			proxy, cleanup, err := tc.proxyServerFunction()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			runAgent(proxy.agent, stopCh)
+
+			// Wait for agent to register on proxy server
+			wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
+
+				ready, _ := proxy.server.Readiness.Ready()
+				return ready, nil
+			})
 
 			// run test client
 
-			c, err := tc.clientFunction(ctx, ps.FrontAddr(), server.URL)
+			c, err := tc.clientFunction(ctx, proxy.front, server.URL)
 			if err != nil {
-				t.Fatalf("error obtaining client: %v", err)
+				t.Errorf("error obtaining client: %v", err)
 			}
 
 			_, err = clientRequest(c, server.URL)
@@ -76,10 +71,13 @@ func TestProxy_Agent_Disconnect_Persistent_Connection(t *testing.T) {
 			if err != nil {
 				t.Errorf("expected no error on proxy request, got %v", err)
 			}
-			a.Stop()
+			close(stopCh)
 
 			// Wait for the agent to disconnect
-			waitForConnectedAgentCount(t, 0, ps)
+			wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
+				ready, _ := proxy.server.Readiness.Ready()
+				return !ready, nil
+			})
 
 			// Reuse same client to make the request
 			_, err = clientRequest(c, server.URL)
@@ -95,7 +93,7 @@ func TestProxy_Agent_Disconnect_Persistent_Connection(t *testing.T) {
 func TestProxy_Agent_Reconnect(t *testing.T) {
 	testcases := []struct {
 		name                string
-		proxyServerFunction func(testing.TB) framework.ProxyServer
+		proxyServerFunction func() (proxy, func(), error)
 		clientFunction      func(context.Context, string, string) (*http.Client, error)
 	}{
 		{
@@ -117,37 +115,56 @@ func TestProxy_Agent_Reconnect(t *testing.T) {
 			server := httptest.NewServer(newEchoServer("hello"))
 			defer server.Close()
 
-			ps := tc.proxyServerFunction(t)
-			defer ps.Stop()
+			stopCh := make(chan struct{})
 
-			ai1 := runAgent(t, ps.AgentAddr())
-			waitForConnectedServerCount(t, 1, ai1)
+			proxy, cleanup, err := tc.proxyServerFunction()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			runAgent(proxy.agent, stopCh)
+
+			// Wait for agent to register on proxy server
+			wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
+				ready, _ := proxy.server.Readiness.Ready()
+				return ready, nil
+			})
 
 			// run test client
 
-			c, err := tc.clientFunction(ctx, ps.FrontAddr(), server.URL)
+			c, err := tc.clientFunction(ctx, proxy.front, server.URL)
 			if err != nil {
-				t.Fatalf("error obtaining client: %v", err)
+				t.Errorf("error obtaining client: %v", err)
 			}
 
 			_, err = clientRequest(c, server.URL)
 			if err != nil {
 				t.Errorf("expected no error on proxy request, got %v", err)
 			}
-			ai1.Stop()
+			close(stopCh)
 
 			// Wait for the agent to disconnect
-			waitForConnectedAgentCount(t, 0, ps)
+			wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
+				ready, _ := proxy.server.Readiness.Ready()
+				return !ready, nil
+			})
 
 			// Reconnect agent
-			ai2 := runAgent(t, ps.AgentAddr())
-			defer ai2.Stop()
-			waitForConnectedServerCount(t, 1, ai2)
+			stopCh2 := make(chan struct{})
+			runAgent(proxy.agent, stopCh2)
+			defer close(stopCh2)
+
+			// Wait for agent to register on proxy server
+			wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
+				ready, _ := proxy.server.Readiness.Ready()
+				return ready, nil
+			})
 
 			// Proxy requests should work again after agent reconnects
-			c2, err := tc.clientFunction(ctx, ps.FrontAddr(), server.URL)
+			c2, err := tc.clientFunction(ctx, proxy.front, server.URL)
 			if err != nil {
-				t.Fatalf("error obtaining client: %v", err)
+				t.Errorf("error obtaining client: %v", err)
 			}
 
 			_, err = clientRequest(c2, server.URL)
@@ -161,16 +178,17 @@ func TestProxy_Agent_Reconnect(t *testing.T) {
 
 func clientRequest(c *http.Client, addr string) ([]byte, error) {
 	r, err := c.Get(addr)
+
 	if err != nil {
-		return nil, fmt.Errorf("http GET %q: %w", addr, err)
+		return nil, err
 	}
 
-	data, err := io.ReadAll(r.Body)
+	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
+		return nil, err
 	}
 
-	r.Body.Close()
+	defer r.Body.Close()
 
 	return data, nil
 }
@@ -223,7 +241,7 @@ func createHTTPConnectClient(ctx context.Context, proxyAddr, addr string) (*http
 	}
 
 	c := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			Dial: dialer,
 		},

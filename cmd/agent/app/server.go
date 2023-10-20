@@ -1,34 +1,13 @@
-/*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package app
 
 import (
-	"bytes"
-	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
-	runpprof "runtime/pprof"
 	"strconv"
-	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -38,11 +17,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/apiserver-network-proxy/cmd/agent/app/options"
-	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
-
-const ReadHeaderTimeout = 60 * time.Second
 
 func NewAgentCommand(a *Agent, o *options.GrpcProxyAgentOptions) *cobra.Command {
 	cmd := &cobra.Command{
@@ -66,13 +42,11 @@ func (a *Agent) run(o *options.GrpcProxyAgentOptions) error {
 	}
 
 	stopCh := make(chan struct{})
-
-	cs, err := a.runProxyConnection(o, stopCh)
-	if err != nil {
+	if err := a.runProxyConnection(o, stopCh); err != nil {
 		return fmt.Errorf("failed to run proxy connection with %v", err)
 	}
 
-	if err := a.runHealthServer(o, cs); err != nil {
+	if err := a.runHealthServer(o); err != nil {
 		return fmt.Errorf("failed to run health server with %v", err)
 	}
 
@@ -85,11 +59,11 @@ func (a *Agent) run(o *options.GrpcProxyAgentOptions) error {
 	return nil
 }
 
-func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, stopCh <-chan struct{}) (agent.ReadinessManager, error) {
+func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, stopCh <-chan struct{}) error {
 	var tlsConfig *tls.Config
 	var err error
 	if tlsConfig, err = util.GetClientTLSConfig(o.CaCert, o.AgentCert, o.AgentKey, o.ProxyServerHost, o.AlpnProtos); err != nil {
-		return nil, err
+		return err
 	}
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
@@ -102,45 +76,15 @@ func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, stopCh <-ch
 	cs := cc.NewAgentClientSet(stopCh)
 	cs.Serve()
 
-	return cs, nil
+	return nil
 }
 
-func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.ReadinessManager) error {
+func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions) error {
 	livenessHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "ok")
 	})
-
-	checks := []agent.HealthChecker{agent.Ping, agent.NewServerConnected(cs)}
 	readinessHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var failedChecks []string
-		var individualCheckOutput bytes.Buffer
-		for _, check := range checks {
-			if err := check.Check(r); err != nil {
-				fmt.Fprintf(&individualCheckOutput, "[-]%s failed: %v\n", check.Name(), err)
-				failedChecks = append(failedChecks, check.Name())
-			} else {
-				fmt.Fprintf(&individualCheckOutput, "[+]%s ok\n", check.Name())
-			}
-		}
-
-		// Always be verbose if the check has failed
-		if len(failedChecks) > 0 {
-			klog.V(0).Infoln("%s check failed: \n%v", strings.Join(failedChecks, ","), individualCheckOutput.String())
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, individualCheckOutput.String())
-			return
-		}
-
-		if _, found := r.URL.Query()["verbose"]; !found {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "ok")
-			return
-		}
-
-		fmt.Fprintf(&individualCheckOutput, "check passed\n")
-
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, individualCheckOutput.String())
+		fmt.Fprintf(w, "ok")
 	})
 
 	muxHandler := http.NewServeMux()
@@ -150,27 +94,20 @@ func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.Readi
 	muxHandler.HandleFunc("/ready", readinessHandler)
 	muxHandler.HandleFunc("/readyz", readinessHandler)
 	healthServer := &http.Server{
-		Addr:              net.JoinHostPort(o.HealthServerHost, strconv.Itoa(o.HealthServerPort)),
-		Handler:           muxHandler,
-		MaxHeaderBytes:    1 << 20,
-		ReadHeaderTimeout: ReadHeaderTimeout,
+		Addr:           net.JoinHostPort(o.HealthServerHost, strconv.Itoa(o.HealthServerPort)),
+		Handler:        muxHandler,
+		MaxHeaderBytes: 1 << 20,
 	}
 
-	labels := runpprof.Labels(
-		"core", "healthListener",
-		"port", strconv.Itoa(o.HealthServerPort),
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveHealth(healthServer) })
+	go func() {
+		err := healthServer.ListenAndServe()
+		if err != nil {
+			klog.ErrorS(err, "health server could not listen")
+		}
+		klog.V(0).Infoln("Health server stopped listening")
+	}()
 
 	return nil
-}
-
-func (a *Agent) serveHealth(healthServer *http.Server) {
-	err := healthServer.ListenAndServe()
-	if err != nil {
-		klog.ErrorS(err, "health server could not listen")
-	}
-	klog.V(0).Infoln("Health server stopped listening")
 }
 
 func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
@@ -182,41 +119,29 @@ func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 		if err != nil {
 			host = r.Host
 		}
-		dest := *r.URL
-		dest.Host = net.JoinHostPort(host, strconv.Itoa(o.HealthServerPort))
-		http.Redirect(w, r, dest.String(), http.StatusMovedPermanently)
+		http.Redirect(w, r, fmt.Sprintf("%s:%d%s", host, o.HealthServerPort, r.URL.Path), http.StatusMovedPermanently)
 	}))
 	if o.EnableProfiling {
 		muxHandler.HandleFunc("/debug/pprof", util.RedirectTo("/debug/pprof/"))
 		muxHandler.HandleFunc("/debug/pprof/", pprof.Index)
-		muxHandler.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		muxHandler.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		muxHandler.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		if o.EnableContentionProfiling {
 			runtime.SetBlockProfileRate(1)
 		}
 	}
 
 	adminServer := &http.Server{
-		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminServerPort)),
-		Handler:           muxHandler,
-		MaxHeaderBytes:    1 << 20,
-		ReadHeaderTimeout: ReadHeaderTimeout,
+		Addr:           fmt.Sprintf("127.0.0.1:%d", o.AdminServerPort),
+		Handler:        muxHandler,
+		MaxHeaderBytes: 1 << 20,
 	}
 
-	labels := runpprof.Labels(
-		"core", "adminListener",
-		"port", strconv.Itoa(o.AdminServerPort),
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveAdmin(adminServer) })
+	go func() {
+		err := adminServer.ListenAndServe()
+		if err != nil {
+			klog.ErrorS(err, "admin server could not listen")
+		}
+		klog.V(0).Infoln("Admin server stopped listening")
+	}()
 
 	return nil
-}
-
-func (a *Agent) serveAdmin(adminServer *http.Server) {
-	err := adminServer.ListenAndServe()
-	if err != nil {
-		klog.ErrorS(err, "admin server could not listen")
-	}
-	klog.V(0).Infoln("Admin server stopped listening")
 }

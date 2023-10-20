@@ -24,8 +24,8 @@ endif
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 INSTALL_LOCATION:=$(shell go env GOPATH)/bin
-GOLANGCI_LINT_VERSION ?= 1.51.2
-GOSEC_VERSION ?= 2.13.1
+GOLANGCI_LINT_VERSION ?= 1.35.2
+GOSEC_VERSION ?= 2.5.0
 
 REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
 STAGING_REGISTRY := gcr.io/k8s-staging-kas-network-proxy
@@ -48,7 +48,6 @@ PROXY_SERVER_IP ?= 127.0.0.1
 ## --------------------------------------
 ## Testing
 ## --------------------------------------
-.PHONY: mock_gen
 mock_gen:
 	mkdir -p proto/agent/mocks
 	mockgen sigs.k8s.io/apiserver-network-proxy/proto/agent AgentService_ConnectServer > proto/agent/mocks/agent_mock.go
@@ -57,14 +56,11 @@ mock_gen:
 
 .PHONY: test
 test:
-	go test -race -covermode=atomic -coverprofile=konnectivity.out ./... && go tool cover -html=konnectivity.out -o=konnectivity.html
-	cd konnectivity-client && go test -race -covermode=atomic -coverprofile=client.out ./... && go tool cover -html=client.out -o=client.html
+	GO111MODULE=on go test -race sigs.k8s.io/apiserver-network-proxy/...
 
 ## --------------------------------------
 ## Binaries
 ## --------------------------------------
-
-SOURCE = $(shell find . -name \*.go)
 
 bin:
 	mkdir -p bin
@@ -72,16 +68,16 @@ bin:
 .PHONY: build
 build: bin/proxy-agent bin/proxy-server bin/proxy-test-client bin/http-test-server
 
-bin/proxy-agent: bin $(SOURCE)
+bin/proxy-agent: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/agent/main.go
 	GO111MODULE=on go build -o bin/proxy-agent cmd/agent/main.go
 
-bin/proxy-test-client: bin $(SOURCE)
-	GO111MODULE=on go build -o bin/proxy-test-client cmd/test-client/main.go
+bin/proxy-test-client: konnectivity-client/proto/client/client.pb.go bin cmd/client/main.go
+	GO111MODULE=on go build -o bin/proxy-test-client cmd/client/main.go
 
-bin/http-test-server: bin $(SOURCE)
+bin/http-test-server: bin cmd/test-server/main.go
 	GO111MODULE=on go build -o bin/http-test-server cmd/test-server/main.go
 
-bin/proxy-server: bin $(SOURCE)
+bin/proxy-server: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/server/main.go pkg/server/server.go pkg/server/metrics/metrics.go
 	GO111MODULE=on go build -o bin/proxy-server cmd/server/main.go
 
 ## --------------------------------------
@@ -91,7 +87,7 @@ bin/proxy-server: bin $(SOURCE)
 .PHONY: lint
 lint:
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(INSTALL_LOCATION) v$(GOLANGCI_LINT_VERSION)
-	$(INSTALL_LOCATION)/golangci-lint run --no-config --disable-all --enable=gofmt,revive,gosec,govet,unused --fix --verbose --timeout 3m
+	$(INSTALL_LOCATION)/golangci-lint run --no-config --disable-all --enable=gofmt,golint,gosec,govet,unused --fix --verbose --timeout 3m
 
 ## --------------------------------------
 ## Go
@@ -106,27 +102,30 @@ mod-download:
 ## --------------------------------------
 
 .PHONY: gen
-gen: mod-download gen-proto mock_gen
+gen: mod-download proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go mock_gen
 
-.PHONY: gen-proto
-gen-proto:
-	protoc -I . konnectivity-client/proto/client/client.proto --go_out=. --go_opt=paths=source_relative --go-grpc_out=require_unimplemented_servers=false:. --go-grpc_opt=paths=source_relative
-	cat hack/go-license-header.txt konnectivity-client/proto/client/client_grpc.pb.go > konnectivity-client/proto/client/client_grpc.licensed.go
-	mv konnectivity-client/proto/client/client_grpc.licensed.go konnectivity-client/proto/client/client_grpc.pb.go
-	protoc -I . proto/agent/agent.proto --go_out=. --go_opt=paths=source_relative --go-grpc_out=require_unimplemented_servers=false:. --go-grpc_opt=paths=source_relative
-	cat hack/go-license-header.txt proto/agent/agent_grpc.pb.go > proto/agent/agent_grpc.licensed.go
-	mv proto/agent/agent_grpc.licensed.go proto/agent/agent_grpc.pb.go
+konnectivity-client/proto/client/client.pb.go: konnectivity-client/proto/client/client.proto
+	mkdir -p ${GOPATH}/src
+	protoc -I . konnectivity-client/proto/client/client.proto --go_out=plugins=grpc:${GOPATH}/src
+	cat hack/go-license-header.txt ${GOPATH}/src/sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client/client.pb.go > konnectivity-client/proto/client/client.licensed.go
+	mv konnectivity-client/proto/client/client.licensed.go konnectivity-client/proto/client/client.pb.go
+
+proto/agent/agent.pb.go: proto/agent/agent.proto
+	mkdir -p ${GOPATH}/src
+	protoc -I . proto/agent/agent.proto --go_out=plugins=grpc:${GOPATH}/src
+	cat hack/go-license-header.txt ${GOPATH}/src/sigs.k8s.io/apiserver-network-proxy/proto/agent/agent.pb.go > proto/agent/agent.licensed.go
+	mv proto/agent/agent.licensed.go proto/agent/agent.pb.go
 
 ## --------------------------------------
 ## Certs
 ## --------------------------------------
 
 easy-rsa.tar.gz:
-	curl -L -o easy-rsa.tar.gz --connect-timeout 20 --retry 6 --retry-delay 2 https://dl.k8s.io/easy-rsa/easy-rsa.tar.gz
+	curl -L -o easy-rsa.tar.gz --connect-timeout 20 --retry 6 --retry-delay 2 https://github.com/OpenVPN/easy-rsa/archive/refs/tags/v3.0.8.tar.gz
 
 easy-rsa: easy-rsa.tar.gz
 	tar xvf easy-rsa.tar.gz
-	mv easy-rsa-master easy-rsa
+	mv easy-rsa-3.0.8 easy-rsa
 
 cfssl:
 	@if ! command -v cfssl &> /dev/null; then \
@@ -179,12 +178,8 @@ certs: easy-rsa cfssl cfssljson
 buildx-setup:
 	${DOCKER_CMD} buildx inspect img-builder > /dev/null || docker buildx create --name img-builder --use
 
-# Does not include test images
 .PHONY: docker-build
 docker-build: docker-build/proxy-agent docker-build/proxy-server
-
-.PHONY: docker-build-test
-docker-build-test: docker-build/proxy-test-client docker-build/http-test-server
 
 .PHONY: docker-push
 docker-push: docker-push/proxy-agent docker-push/proxy-server
@@ -210,28 +205,6 @@ docker-build/proxy-server: cmd/server/main.go proto/agent/agent.pb.go buildx-set
 docker-push/proxy-server: docker-build/proxy-server
 	@[ "${DOCKER_CMD}" ] || ( echo "DOCKER_CMD is not set"; exit 1 )
 	${DOCKER_CMD} push ${SERVER_FULL_IMAGE}-$(ARCH):${TAG}
-
-.PHONY: docker-build/proxy-test-client
-docker-build/proxy-test-client: cmd/test-client/main.go proto/agent/agent.pb.go buildx-setup
-	@[ "${TAG}" ] || ( echo "TAG is not set"; exit 1 )
-	echo "Building proxy-test-client for ${ARCH}"
-	${DOCKER_CMD} buildx build . --pull --output=type=$(OUTPUT_TYPE) --platform linux/$(ARCH) --build-arg ARCH=$(ARCH) -f artifacts/images/test-client-build.Dockerfile -t ${TEST_CLIENT_FULL_IMAGE}-$(ARCH):${TAG}
-
-.PHONY: docker-push/proxy-test-client
-docker-push/proxy-test-client: docker-build/proxy-test-client
-	@[ "${DOCKER_CMD}" ] || ( echo "DOCKER_CMD is not set"; exit 1 )
-	${DOCKER_CMD} push ${TEST_CLIENT_FULL_IMAGE}-$(ARCH):${TAG}
-
-.PHONY: docker-build/http-test-server
-docker-build/http-test-server: cmd/test-server/main.go buildx-setup
-	@[ "${TAG}" ] || ( echo "TAG is not set"; exit 1 )
-	echo "Building http-test-server for ${ARCH}"
-	${DOCKER_CMD} buildx build . --pull --output=type=$(OUTPUT_TYPE) --platform linux/$(ARCH) --build-arg ARCH=$(ARCH) -f artifacts/images/test-server-build.Dockerfile -t ${TEST_SERVER_FULL_IMAGE}-$(ARCH):${TAG}
-
-.PHONY: docker-push/http-test-server
-docker-push/http-test-server: docker-build/http-test-server
-	@[ "${DOCKER_CMD}" ] || ( echo "DOCKER_CMD is not set"; exit 1 )
-	${DOCKER_CMD} push ${TEST_SERVER_FULL_IMAGE}-$(ARCH):${TAG}
 
 ## --------------------------------------
 ## Docker — All ARCH
@@ -289,6 +262,8 @@ release-staging: ## Builds and push container images to the staging bucket.
 release-alias-tag: # Adds the tag to the last build tag. BASE_REF comes from the cloudbuild.yaml
 	gcloud container images add-tag $(AGENT_FULL_IMAGE):$(TAG) $(AGENT_FULL_IMAGE):$(BASE_REF)
 	gcloud container images add-tag $(SERVER_FULL_IMAGE):$(TAG) $(SERVER_FULL_IMAGE):$(BASE_REF)
+	gcloud container images add-tag $(TEST_CLIENT_FULL_IMAGE):$(TAG) $(TEST_CLIENT_FULL_IMAGE):$(BASE_REF)
+	gcloud container images add-tag $(TEST_SERVER_FULL_IMAGE):$(TAG) $(TEST_SERVER_FULL_IMAGE):$(BASE_REF)
 
 ## --------------------------------------
 ## Cleanup / Verification
@@ -297,4 +272,4 @@ release-alias-tag: # Adds the tag to the last build tag. BASE_REF comes from the
 .PHONY: clean
 clean:
 	go clean -testcache
-	rm -rf proto/agent/agent.pb.go proto/agent/agent_grpc.pb.go konnectivity-client/proto/client/client.pb.go konnectivity-client/proto/client/client_grpc.pb.go konnectivity-client/proto/client/client_grpc.licensed.go proto/agent/agent_grpc.licensed.go easy-rsa.tar.gz easy-rsa cfssl cfssljson certs bin proto/agent/mocks konnectivity.html konnectivity.out konnectivity-client/client.html konnectivity-client/client.out
+	rm -rf proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go easy-rsa.tar.gz easy-rsa cfssl cfssljson certs bin proto/agent/mocks
