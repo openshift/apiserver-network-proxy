@@ -20,7 +20,7 @@ import (
 	"context"
 
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/apiserver-network-proxy/proto/header"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 )
 
 type DefaultRouteBackendManager struct {
@@ -32,7 +32,7 @@ var _ BackendManager = &DefaultRouteBackendManager{}
 func NewDefaultRouteBackendManager() *DefaultRouteBackendManager {
 	return &DefaultRouteBackendManager{
 		DefaultBackendStorage: NewDefaultBackendStorage(
-			[]header.IdentifierType{header.DefaultRoute})}
+			[]agent.IdentifierType{agent.DefaultRoute})}
 }
 
 // Backend tries to get a backend associating to the request destination host.

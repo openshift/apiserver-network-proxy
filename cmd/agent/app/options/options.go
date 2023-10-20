@@ -1,27 +1,9 @@
-/*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package options
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,7 +13,6 @@ import (
 
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
-	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
 type GrpcProxyAgentOptions struct {
@@ -45,14 +26,10 @@ type GrpcProxyAgentOptions struct {
 	ProxyServerPort int
 	AlpnProtos      []string
 
-	// Bind address for the health connections.
+	// Ports for the health and admin server
 	HealthServerHost string
-	// Port we listen for health connections on.
 	HealthServerPort int
-	// Bind address for the admin connections.
-	AdminBindAddress string
-	// Port we listen for admin connections on.
-	AdminServerPort int
+	AdminServerPort  int
 	// Enables pprof at host:adminPort/debug/pprof.
 	EnableProfiling bool
 	// If EnableProfiling is true, this enables the lock contention
@@ -83,7 +60,7 @@ type GrpcProxyAgentOptions struct {
 
 func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) *agent.ClientSetConfig {
 	return &agent.ClientSetConfig{
-		Address:                 net.JoinHostPort(o.ProxyServerHost, strconv.Itoa(o.ProxyServerPort)),
+		Address:                 fmt.Sprintf("%s:%d", o.ProxyServerHost, o.ProxyServerPort),
 		AgentID:                 o.AgentID,
 		AgentIdentifiers:        o.AgentIdentifiers,
 		SyncInterval:            o.SyncInterval,
@@ -107,10 +84,9 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.HealthServerHost, "health-server-host", o.HealthServerHost, "The host address to listen on, without port.")
 	flags.IntVar(&o.HealthServerPort, "health-server-port", o.HealthServerPort, "The port the health server is listening on.")
 	flags.IntVar(&o.AdminServerPort, "admin-server-port", o.AdminServerPort, "The port the admin server is listening on.")
-	flags.StringVar(&o.AdminBindAddress, "admin-bind-address", o.AdminBindAddress, "Bind address for admin connections. If empty, we will bind to all interfaces.")
 	flags.BoolVar(&o.EnableProfiling, "enable-profiling", o.EnableProfiling, "enable pprof at host:admin-port/debug/pprof")
 	flags.BoolVar(&o.EnableContentionProfiling, "enable-contention-profiling", o.EnableContentionProfiling, "enable contention profiling at host:admin-port/debug/pprof/block. \"--enable-profiling\" must also be set.")
-	flags.StringVar(&o.AgentID, "agent-id", o.AgentID, "The unique ID of this agent. Can also be set by the 'PROXY_AGENT_ID' environment variable. Default to a generated uuid if not set.")
+	flags.StringVar(&o.AgentID, "agent-id", o.AgentID, "The unique ID of this agent. Default to a generated uuid if not set.")
 	flags.DurationVar(&o.SyncInterval, "sync-interval", o.SyncInterval, "The initial interval by which the agent periodically checks if it has connections to all instances of the proxy server.")
 	flags.DurationVar(&o.ProbeInterval, "probe-interval", o.ProbeInterval, "The interval by which the agent periodically checks if its connections to the proxy server are ready.")
 	flags.DurationVar(&o.SyncIntervalCap, "sync-interval-cap", o.SyncIntervalCap, "The maximum interval for the SyncInterval to back off to when unable to connect to the proxy server")
@@ -131,7 +107,6 @@ func (o *GrpcProxyAgentOptions) Print() {
 	klog.V(1).Infof("ALPNProtos set to %+s.\n", o.AlpnProtos)
 	klog.V(1).Infof("HealthServerHost set to %s\n", o.HealthServerHost)
 	klog.V(1).Infof("HealthServerPort set to %d.\n", o.HealthServerPort)
-	klog.V(1).Infof("Admin bind address set to %q.\n", o.AdminBindAddress)
 	klog.V(1).Infof("AdminServerPort set to %d.\n", o.AdminServerPort)
 	klog.V(1).Infof("EnableProfiling set to %v.\n", o.EnableProfiling)
 	klog.V(1).Infof("EnableContentionProfiling set to %v.\n", o.EnableContentionProfiling)
@@ -200,12 +175,12 @@ func validateAgentIdentifiers(agentIdentifiers string) error {
 		return err
 	}
 	for idType := range decoded {
-		switch header.IdentifierType(idType) {
-		case header.IPv4:
-		case header.IPv6:
-		case header.CIDR:
-		case header.Host:
-		case header.DefaultRoute:
+		switch agent.IdentifierType(idType) {
+		case agent.IPv4:
+		case agent.IPv6:
+		case agent.CIDR:
+		case agent.Host:
+		case agent.DefaultRoute:
 		default:
 			return fmt.Errorf("unknown address type: %s", idType)
 		}
@@ -222,11 +197,10 @@ func NewGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		ProxyServerPort:           8091,
 		HealthServerHost:          "",
 		HealthServerPort:          8093,
-		AdminBindAddress:          "127.0.0.1",
 		AdminServerPort:           8094,
 		EnableProfiling:           false,
 		EnableContentionProfiling: false,
-		AgentID:                   defaultAgentID(),
+		AgentID:                   uuid.New().String(),
 		AgentIdentifiers:          "",
 		SyncInterval:              1 * time.Second,
 		ProbeInterval:             1 * time.Second,
@@ -237,13 +211,4 @@ func NewGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		SyncForever:               false,
 	}
 	return &o
-}
-
-func defaultAgentID() string {
-	// Default to the value set by the PROXY_AGENT_ID environment variable. If both the flag &
-	// environment variable are set, the flag always wins.
-	if id := os.Getenv("PROXY_AGENT_ID"); id != "" {
-		return id
-	}
-	return uuid.New().String()
 }

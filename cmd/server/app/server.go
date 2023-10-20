@@ -1,19 +1,3 @@
-/*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package app
 
 import (
@@ -21,18 +5,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
-	netpprof "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	runpprof "runtime/pprof"
-	"strconv"
+	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -51,8 +34,6 @@ import (
 )
 
 var udsListenerLock sync.Mutex
-
-const ReadHeaderTimeout = 60 * time.Second
 
 func NewProxyCommand(p *Proxy, o *options.ProxyRunOptions) *cobra.Command {
 	cmd := &cobra.Command{
@@ -126,7 +107,7 @@ func (p *Proxy) run(o *options.ProxyRunOptions) error {
 	if err != nil {
 		return err
 	}
-	server := server.NewProxyServer(o.ServerID, ps, int(o.ServerCount), authOpt)
+	server := server.NewProxyServer(o.ServerID, ps, int(o.ServerCount), authOpt, o.WarnOnChannelLimit)
 
 	frontendStop, err := p.runFrontendServer(ctx, o, server)
 	if err != nil {
@@ -166,19 +147,14 @@ func SetupSignalHandler() (stopCh <-chan struct{}) {
 	stop := make(chan struct{})
 	c := make(chan os.Signal, 2)
 	signal.Notify(c, shutdownSignals...)
-	labels := runpprof.Labels(
-		"core", "signalHandler",
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { handleSignals(c, stop) })
+	go func() {
+		<-c
+		close(stop)
+		<-c
+		os.Exit(1) // second signal. Exit directly.
+	}()
 
 	return stop
-}
-
-func handleSignals(signalCh chan os.Signal, stopCh chan struct{}) {
-	<-signalCh
-	close(stopCh)
-	<-signalCh
-	os.Exit(1) // second signal. Exit directly.
 }
 
 func getUDSListener(ctx context.Context, udsName string) (net.Listener, error) {
@@ -218,16 +194,11 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 		if err != nil {
 			return nil, fmt.Errorf("failed to get uds listener: %v", err)
 		}
-		labels := runpprof.Labels(
-			"core", "udsGrpcFrontend",
-			"udsFile", o.UdsName,
-		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go grpcServer.Serve(lis)
 		stop = grpcServer.GracefulStop
 	} else {
 		// http-connect
 		server := &http.Server{
-			ReadHeaderTimeout: ReadHeaderTimeout,
 			Handler: &server.Tunnel{
 				Server: s,
 			},
@@ -236,11 +207,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			err := server.Shutdown(ctx)
 			klog.ErrorS(err, "error shutting down server")
 		}
-		labels := runpprof.Labels(
-			"core", "udsHttpFrontend",
-			"udsFile", o.UdsName,
-		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go func() {
 			udsListener, err := getUDSListener(ctx, o.UdsName)
 			if err != nil {
 				klog.ErrorS(err, "failed to get uds listener")
@@ -253,26 +220,26 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			if err != nil {
 				klog.ErrorS(err, "failed to serve uds requests")
 			}
-		})
+		}()
 	}
 
 	return stop, nil
 }
 
-func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []string) (*tls.Config, error) {
+func (p *Proxy) getTLSConfig(caFile, certFile, keyFile, cipherSuites string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load X509 key pair %s and %s: %v", certFile, keyFile, err)
 	}
 
-	cipherSuiteIDs := tlsCipherSuites(cipherSuites)
+	cipherSuiteIDs := tlsCipherSuites(strings.Split(cipherSuites, ","))
 
 	if caFile == "" {
 		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, CipherSuites: cipherSuiteIDs}, nil
 	}
 
 	certPool := x509.NewCertPool()
-	caCert, err := os.ReadFile(filepath.Clean(caFile))
+	caCert, err := ioutil.ReadFile(filepath.Clean(caFile))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cluster CA cert %s: %v", caFile, err)
 	}
@@ -301,7 +268,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		return nil, err
 	}
 
-	addr := net.JoinHostPort(o.ServerBindAddress, strconv.Itoa(o.ServerPort))
+	addr := fmt.Sprintf(":%d", o.ServerPort)
 
 	if o.Mode == "grpc" {
 		frontendServerOptions := []grpc.ServerOption{
@@ -314,18 +281,13 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		if err != nil {
 			return nil, fmt.Errorf("failed to listen on %s: %v", addr, err)
 		}
-		labels := runpprof.Labels(
-			"core", "mtlsGrpcFrontend",
-			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
-		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go grpcServer.Serve(lis)
 		stop = grpcServer.GracefulStop
 	} else {
 		// http-connect
 		server := &http.Server{
-			ReadHeaderTimeout: ReadHeaderTimeout,
-			Addr:              addr,
-			TLSConfig:         tlsConfig,
+			Addr:      addr,
+			TLSConfig: tlsConfig,
 			Handler: &server.Tunnel{
 				Server: s,
 			},
@@ -337,16 +299,12 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 				klog.ErrorS(err, "failed to shutdown server")
 			}
 		}
-		labels := runpprof.Labels(
-			"core", "mtlsHttpFrontend",
-			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
-		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go func() {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
 			}
-		})
+		}()
 	}
 
 	return stop, nil
@@ -359,14 +317,10 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 		return err
 	}
 
-	addr := net.JoinHostPort(o.AgentBindAddress, strconv.Itoa(o.AgentPort))
+	addr := fmt.Sprintf(":%d", o.AgentPort)
 	agentServerOptions := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime}),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             30 * time.Second,
-			PermitWithoutStream: true,
-		}),
 	}
 	grpcServer := grpc.NewServer(agentServerOptions...)
 	agent.RegisterAgentServiceServer(grpcServer, server)
@@ -374,11 +328,7 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", addr, err)
 	}
-	labels := runpprof.Labels(
-		"core", "agentListener",
-		"port", strconv.FormatUint(uint64(o.AgentPort), 10),
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+	go grpcServer.Serve(lis)
 
 	return nil
 }
@@ -388,32 +338,24 @@ func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyS
 	muxHandler.Handle("/metrics", promhttp.Handler())
 	if o.EnableProfiling {
 		muxHandler.HandleFunc("/debug/pprof", util.RedirectTo("/debug/pprof/"))
-		muxHandler.HandleFunc("/debug/pprof/", netpprof.Index)
-		muxHandler.HandleFunc("/debug/pprof/profile", netpprof.Profile)
-		muxHandler.HandleFunc("/debug/pprof/symbol", netpprof.Symbol)
-		muxHandler.HandleFunc("/debug/pprof/trace", netpprof.Trace)
+		muxHandler.HandleFunc("/debug/pprof/", pprof.Index)
 		if o.EnableContentionProfiling {
 			runtime.SetBlockProfileRate(1)
 		}
 	}
 	adminServer := &http.Server{
-		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminPort)),
-		Handler:           muxHandler,
-		MaxHeaderBytes:    1 << 20,
-		ReadHeaderTimeout: ReadHeaderTimeout,
+		Addr:           fmt.Sprintf("127.0.0.1:%d", o.AdminPort),
+		Handler:        muxHandler,
+		MaxHeaderBytes: 1 << 20,
 	}
 
-	labels := runpprof.Labels(
-		"core", "adminListener",
-		"port", strconv.FormatUint(uint64(o.AdminPort), 10),
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) {
+	go func() {
 		err := adminServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "admin server could not listen")
 		}
 		klog.V(1).Infoln("Admin server stopped listening")
-	})
+	}()
 
 	return nil
 }
@@ -439,23 +381,18 @@ func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.Proxy
 	muxHandler.HandleFunc("/ready", readinessHandler)
 	muxHandler.HandleFunc("/readyz", readinessHandler)
 	healthServer := &http.Server{
-		Addr:              net.JoinHostPort(o.HealthBindAddress, strconv.Itoa(o.HealthPort)),
-		Handler:           muxHandler,
-		MaxHeaderBytes:    1 << 20,
-		ReadHeaderTimeout: ReadHeaderTimeout,
+		Addr:           fmt.Sprintf(":%d", o.HealthPort),
+		Handler:        muxHandler,
+		MaxHeaderBytes: 1 << 20,
 	}
 
-	labels := runpprof.Labels(
-		"core", "healthListener",
-		"port", strconv.FormatUint(uint64(o.HealthPort), 10),
-	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) {
+	go func() {
 		err := healthServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "health server could not listen")
 		}
 		klog.V(1).Infoln("Health server stopped listening")
-	})
+	}()
 
 	return nil
 }
