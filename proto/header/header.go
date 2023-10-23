@@ -16,6 +16,12 @@ limitations under the License.
 
 package header
 
+import (
+	"fmt"
+	"net/url"
+	"strconv"
+)
+
 const (
 	ServerCount      = "serverCount"
 	ServerID         = "serverID"
@@ -32,3 +38,56 @@ const (
 	// UserAgent is used to provide the client information in a proxy request
 	UserAgent = "user-agent"
 )
+
+// Identifiers stores agent identifiers that will be used by the server when
+// choosing agents
+type Identifiers struct {
+	IPv4         []string
+	IPv6         []string
+	Host         []string
+	CIDR         []string
+	DefaultRoute bool
+}
+
+type IdentifierType string
+
+const (
+	IPv4         IdentifierType = "ipv4"
+	IPv6         IdentifierType = "ipv6"
+	Host         IdentifierType = "host"
+	CIDR         IdentifierType = "cidr"
+	UID          IdentifierType = "uid"
+	DefaultRoute IdentifierType = "default-route"
+)
+
+// GenAgentIdentifiers generates an Identifiers based on the input string, the
+// input string should be a URL encoded mapping from IdentifierType to values.
+func GenAgentIdentifiers(addrs string) (Identifiers, error) {
+	var agentIdents Identifiers
+	decoded, err := url.ParseQuery(addrs)
+	if err != nil {
+		return agentIdents, fmt.Errorf("fail to parse url encoded string: %v", err)
+	}
+	for idType, ids := range decoded {
+		switch IdentifierType(idType) {
+		case IPv4:
+			agentIdents.IPv4 = append(agentIdents.IPv4, ids...)
+		case IPv6:
+			agentIdents.IPv6 = append(agentIdents.IPv6, ids...)
+		case Host:
+			agentIdents.Host = append(agentIdents.Host, ids...)
+		case CIDR:
+			agentIdents.CIDR = append(agentIdents.CIDR, ids...)
+		case DefaultRoute:
+			defaultRouteIdentifier, err := strconv.ParseBool(ids[0])
+			if err == nil && defaultRouteIdentifier {
+				agentIdents.DefaultRoute = true
+			}
+		default:
+			// To support binary skew with agents that send new identifier type,
+			// fail open. The better place to validate more strictly is within the agent.
+			continue
+		}
+	}
+	return agentIdents, nil
+}
