@@ -1,10 +1,25 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package tests
 
 import (
 	"context"
 	"net"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -47,22 +62,15 @@ func TestEchoServer(t *testing.T) {
 		}
 	}()
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
+	ps := runGRPCProxyServer(t)
+	defer ps.Stop()
 
-	proxy, cleanup, err := runGRPCProxyServer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-
-	runAgent(proxy.agent, stopCh)
-
-	// Wait for agent to register on proxy server
-	time.Sleep(time.Second)
+	a := runAgent(t, ps.AgentAddr())
+	defer a.Stop()
+	waitForConnectedServerCount(t, 1, a)
 
 	// run test client
-	tunnel, err := client.CreateSingleUseGrpcTunnel(ctx, proxy.front, grpc.WithInsecure())
+	tunnel, err := client.CreateSingleUseGrpcTunnel(ctx, ps.FrontAddr(), grpc.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
