@@ -1,6 +1,8 @@
 module sigs.k8s.io/apiserver-network-proxy
 
-go 1.22
+go 1.23
+
+toolchain go1.23.4
 
 require (
 	github.com/golang/mock v1.6.0
