@@ -125,7 +125,7 @@ func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.Readi
 
 		// Always be verbose if the check has failed
 		if len(failedChecks) > 0 {
-			klog.V(0).Infoln("%s check failed: \n%v", strings.Join(failedChecks, ","), individualCheckOutput.String())
+			klog.V(2).Infof("%s check failed: \n%v", strings.Join(failedChecks, ","), individualCheckOutput.String())
 			w.WriteHeader(http.StatusServiceUnavailable)
 			fmt.Fprintf(w, individualCheckOutput.String())
 			return
