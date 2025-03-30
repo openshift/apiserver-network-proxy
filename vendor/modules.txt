@@ -579,7 +579,7 @@ k8s.io/kube-openapi/pkg/schemamutation
 k8s.io/kube-openapi/pkg/spec3
 k8s.io/kube-openapi/pkg/util/proto
 k8s.io/kube-openapi/pkg/validation/spec
-# k8s.io/utils v0.0.0-20230209194617-a36077c30491
+# k8s.io/utils v0.0.0-20250321185631-1f6e0b77f77e
 ## explicit; go 1.18
 k8s.io/utils/clock
 k8s.io/utils/clock/testing
