@@ -136,7 +136,6 @@ go.uber.org/goleak
 go.uber.org/goleak/internal/stack
 # golang.org/x/net v0.23.0
 ## explicit; go 1.18
-golang.org/x/net/context
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
 golang.org/x/net/http2/hpack
@@ -164,7 +163,7 @@ golang.org/x/text/unicode/norm
 # golang.org/x/time v0.0.0-20220210224613-90d013bbcef8
 ## explicit
 golang.org/x/time/rate
-# google.golang.org/appengine v1.6.7
+# google.golang.org/appengine v1.6.8
 ## explicit; go 1.11
 google.golang.org/appengine/internal
 google.golang.org/appengine/internal/base
