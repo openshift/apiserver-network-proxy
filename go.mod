@@ -1,6 +1,8 @@
 module sigs.k8s.io/apiserver-network-proxy
 
-go 1.20
+go 1.22.0
+
+toolchain go1.22.9
 
 require (
 	github.com/golang/mock v1.6.0
@@ -12,7 +14,7 @@ require (
 	go.uber.org/goleak v1.2.1
 	golang.org/x/net v0.23.0
 	google.golang.org/grpc v1.56.3
-	google.golang.org/protobuf v1.30.0
+	google.golang.org/protobuf v1.36.6
 	k8s.io/api v0.27.4
 	k8s.io/apimachinery v0.27.4
 	k8s.io/client-go v0.27.4
@@ -48,7 +50,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_model v0.3.0 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.37.0 // indirect
 	github.com/prometheus/procfs v0.8.0 // indirect
 	golang.org/x/oauth2 v0.7.0 // indirect
