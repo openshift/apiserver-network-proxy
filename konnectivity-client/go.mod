@@ -5,7 +5,7 @@ go 1.20
 // Prefer to keep requirements compatible with the oldest supported
 // k/k minor version, to prevent client backport issues.
 require (
-	github.com/prometheus/client_golang v1.11.1
+	github.com/prometheus/client_golang v1.22.0
 	go.uber.org/goleak v1.2.0
 	golang.org/x/net v0.17.0 // indirect
 	google.golang.org/grpc v1.56.3
