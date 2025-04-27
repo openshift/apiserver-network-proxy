@@ -13,10 +13,10 @@ require (
 	golang.org/x/net v0.23.0
 	google.golang.org/grpc v1.56.3
 	google.golang.org/protobuf v1.30.0
-	k8s.io/api v0.27.4
-	k8s.io/apimachinery v0.27.4
-	k8s.io/client-go v0.27.4
-	k8s.io/component-base v0.27.4
+	k8s.io/api v0.33.0
+	k8s.io/apimachinery v0.33.0
+	k8s.io/client-go v0.33.0
+	k8s.io/component-base v0.33.0
 	k8s.io/klog/v2 v2.90.1
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.0
 )
