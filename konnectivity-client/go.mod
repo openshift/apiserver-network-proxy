@@ -7,7 +7,7 @@ go 1.20
 require (
 	github.com/prometheus/client_golang v1.11.1
 	go.uber.org/goleak v1.2.0
-	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/net v0.39.0 // indirect
 	google.golang.org/grpc v1.56.3
 	google.golang.org/protobuf v1.30.0
 	k8s.io/klog/v2 v2.0.0
