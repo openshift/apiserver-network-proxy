@@ -1,6 +1,8 @@
 module sigs.k8s.io/apiserver-network-proxy/konnectivity-client
 
-go 1.20
+go 1.22
+
+toolchain go1.23.9
 
 // Prefer to keep requirements compatible with the oldest supported
 // k/k minor version, to prevent client backport issues.
@@ -9,7 +11,7 @@ require (
 	go.uber.org/goleak v1.2.0
 	golang.org/x/net v0.17.0 // indirect
 	google.golang.org/grpc v1.56.3
-	google.golang.org/protobuf v1.30.0
+	google.golang.org/protobuf v1.36.6
 	k8s.io/klog/v2 v2.0.0
 )
 
