@@ -18,7 +18,7 @@ require (
 	k8s.io/client-go v0.27.4
 	k8s.io/component-base v0.27.4
 	k8s.io/klog/v2 v2.90.1
-	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.0
+	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.33.0
 )
 
 require (
