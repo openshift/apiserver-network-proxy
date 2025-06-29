@@ -1,6 +1,8 @@
 module sigs.k8s.io/apiserver-network-proxy
 
-go 1.20
+go 1.22
+
+toolchain go1.23.9
 
 require (
 	github.com/golang/mock v1.6.0
@@ -51,6 +53,7 @@ require (
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.37.0 // indirect
 	github.com/prometheus/procfs v0.8.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/oauth2 v0.7.0 // indirect
 	golang.org/x/sys v0.18.0 // indirect
 	golang.org/x/term v0.18.0 // indirect
@@ -65,7 +68,7 @@ require (
 	k8s.io/utils v0.0.0-20230209194617-a36077c30491 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.2.3 // indirect
-	sigs.k8s.io/yaml v1.3.0 // indirect
+	sigs.k8s.io/yaml v1.5.0 // indirect
 )
 
 replace sigs.k8s.io/apiserver-network-proxy/konnectivity-client => ./konnectivity-client
