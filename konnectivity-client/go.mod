@@ -1,6 +1,8 @@
 module sigs.k8s.io/apiserver-network-proxy/konnectivity-client
 
-go 1.20
+go 1.23.0
+
+toolchain go1.23.9
 
 // Prefer to keep requirements compatible with the oldest supported
 // k/k minor version, to prevent client backport issues.
@@ -23,6 +25,6 @@ require (
 	github.com/prometheus/common v0.26.0 // indirect
 	github.com/prometheus/procfs v0.6.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
-	golang.org/x/text v0.13.0 // indirect
+	golang.org/x/text v0.27.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230525234030-28d5490b6b19 // indirect
 )
