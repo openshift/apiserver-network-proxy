@@ -19,14 +19,15 @@ package options
 import (
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
@@ -74,7 +75,7 @@ type ProxyRunOptions struct {
 	// ID of this proxy server.
 	ServerID string
 	// Number of proxy server instances, should be 1 unless it is a HA proxy server.
-	ServerCount uint
+	ServerCount int
 	// Agent pod's namespace for token-based agent authentication
 	AgentNamespace string
 	// Agent pod's service account for token-based agent authentication
@@ -87,13 +88,15 @@ type ProxyRunOptions struct {
 	KubeconfigQPS float32
 	// Client maximum burst for throttle.
 	KubeconfigBurst int
+	// Content type of requests sent to apiserver.
+	APIContentType string
 
 	// Proxy strategies used by the server.
 	// NOTE the order of the strategies matters. e.g., for list
-	// "destHost,destCIDR", the server will try to find a backend associating
+	// "destHost,destCIDR,default", the server will try to find a backend associating
 	// to the destination host first, if not found, it will try to find a
 	// backend within the destCIDR. if it still can't find any backend,
-	// it will use the default backend manager to choose a random backend.
+	// it will choose a random backend.
 	ProxyStrategies string
 
 	// Cipher suites used by the server.
@@ -101,7 +104,17 @@ type ProxyRunOptions struct {
 	// also checks if given comma separated list contains cipher from tls.InsecureCipherSuites().
 	// NOTE that cipher suites are not configurable for TLS1.3,
 	// see: https://pkg.go.dev/crypto/tls#Config, so in that case, this option won't have any effect.
-	CipherSuites []string
+	CipherSuites   []string
+	XfrChannelSize int
+
+	// Lease controller configuration
+	EnableLeaseController bool
+	// Lease Namespace
+	LeaseNamespace string
+	// Lease Labels
+	LeaseLabel string
+	// Needs kubernetes client
+	NeedsKubernetesClient bool
 }
 
 func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
@@ -128,16 +141,20 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.BoolVar(&o.EnableProfiling, "enable-profiling", o.EnableProfiling, "enable pprof at host:admin-port/debug/pprof")
 	flags.BoolVar(&o.EnableContentionProfiling, "enable-contention-profiling", o.EnableContentionProfiling, "enable contention profiling at host:admin-port/debug/pprof/block. \"--enable-profiling\" must also be set.")
 	flags.StringVar(&o.ServerID, "server-id", o.ServerID, "The unique ID of this server. Can also be set by the 'PROXY_SERVER_ID' environment variable.")
-	flags.UintVar(&o.ServerCount, "server-count", o.ServerCount, "The number of proxy server instances, should be 1 unless it is an HA server.")
+	flags.IntVar(&o.ServerCount, "server-count", o.ServerCount, "The number of proxy server instances, should be 1 unless it is an HA server.")
 	flags.StringVar(&o.AgentNamespace, "agent-namespace", o.AgentNamespace, "Expected agent's namespace during agent authentication (used with agent-service-account, authentication-audience, kubeconfig).")
 	flags.StringVar(&o.AgentServiceAccount, "agent-service-account", o.AgentServiceAccount, "Expected agent's service account during agent authentication (used with agent-namespace, authentication-audience, kubeconfig).")
 	flags.StringVar(&o.KubeconfigPath, "kubeconfig", o.KubeconfigPath, "absolute path to the kubeconfig file (used with agent-namespace, agent-service-account, authentication-audience).")
 	flags.Float32Var(&o.KubeconfigQPS, "kubeconfig-qps", o.KubeconfigQPS, "Maximum client QPS (proxy server uses this client to authenticate agent tokens).")
 	flags.IntVar(&o.KubeconfigBurst, "kubeconfig-burst", o.KubeconfigBurst, "Maximum client burst (proxy server uses this client to authenticate agent tokens).")
+	flags.StringVar(&o.APIContentType, "kube-api-content-type", o.APIContentType, "Content type of requests sent to apiserver.")
 	flags.StringVar(&o.AuthenticationAudience, "authentication-audience", o.AuthenticationAudience, "Expected agent's token authentication audience (used with agent-namespace, agent-service-account, kubeconfig).")
-	flags.StringVar(&o.ProxyStrategies, "proxy-strategies", o.ProxyStrategies, "The list of proxy strategies used by the server to pick a backend/tunnel, available strategies are: default, destHost.")
+	flags.StringVar(&o.ProxyStrategies, "proxy-strategies", o.ProxyStrategies, "The list of proxy strategies used by the server to pick an agent/tunnel, available strategies are: default, destHost, defaultRoute.")
 	flags.StringSliceVar(&o.CipherSuites, "cipher-suites", o.CipherSuites, "The comma separated list of allowed cipher suites. Has no effect on TLS1.3. Empty means allow default list.")
-
+	flags.IntVar(&o.XfrChannelSize, "xfr-channel-size", o.XfrChannelSize, "The size of the two KNP server channels used in server for transferring data. One channel is for data coming from the Kubernetes API Server, and the other one is for data coming from the KNP agent.")
+	flags.BoolVar(&o.EnableLeaseController, "enable-lease-controller", o.EnableLeaseController, "Enable lease controller to publish and garbage collect proxy server leases.")
+	flags.StringVar(&o.LeaseNamespace, "lease-namespace", o.LeaseNamespace, "The namespace where lease objects are managed by the controller.")
+	flags.StringVar(&o.LeaseLabel, "lease-label", o.LeaseLabel, "The labels on which the lease objects are managed.")
 	flags.Bool("warn-on-channel-limit", true, "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 	flags.MarkDeprecated("warn-on-channel-limit", "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 
@@ -174,8 +191,13 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("KubeconfigPath set to %q.\n", o.KubeconfigPath)
 	klog.V(1).Infof("KubeconfigQPS set to %f.\n", o.KubeconfigQPS)
 	klog.V(1).Infof("KubeconfigBurst set to %d.\n", o.KubeconfigBurst)
+	klog.V(1).Infof("APIContentType set to %v.\n", o.APIContentType)
 	klog.V(1).Infof("ProxyStrategies set to %q.\n", o.ProxyStrategies)
+	klog.V(1).Infof("EnableLeaseController set to %v.\n", o.EnableLeaseController)
+	klog.V(1).Infof("LeaseNamespace set to %s.\n", o.LeaseNamespace)
+	klog.V(1).Infof("LeaseLabel set to %s.\n", o.LeaseLabel)
 	klog.V(1).Infof("CipherSuites set to %q.\n", o.CipherSuites)
+	klog.V(1).Infof("XfrChannelSize set to %d.\n", o.XfrChannelSize)
 }
 
 func (o *ProxyRunOptions) Validate() error {
@@ -221,7 +243,7 @@ func (o *ProxyRunOptions) Validate() error {
 			return fmt.Errorf("error checking cluster CA cert %s, got %v", o.ClusterCaCert, err)
 		}
 	}
-	if o.Mode != "grpc" && o.Mode != "http-connect" {
+	if o.Mode != server.ModeGRPC && o.Mode != server.ModeHTTPConnect {
 		return fmt.Errorf("mode must be set to either 'grpc' or 'http-connect' not %q", o.Mode)
 	}
 	if o.UdsName != "" {
@@ -268,43 +290,37 @@ func (o *ProxyRunOptions) Validate() error {
 	if o.EnableContentionProfiling && !o.EnableProfiling {
 		return fmt.Errorf("if --enable-contention-profiling is set, --enable-profiling must also be set")
 	}
-
-	// validate agent authentication params
-	// all 4 parameters must be empty or must have value (except KubeconfigPath that might be empty)
-	if o.AgentNamespace != "" || o.AgentServiceAccount != "" || o.AuthenticationAudience != "" || o.KubeconfigPath != "" {
+	usingServiceAccountAuth := o.AgentNamespace != "" || o.AgentServiceAccount != "" || o.AuthenticationAudience != ""
+	if usingServiceAccountAuth {
 		if o.ClusterCaCert != "" {
-			return fmt.Errorf("ClusterCaCert can not be used when service account authentication is enabled")
+			return fmt.Errorf("--cluster-ca-cert can not be used when agent authentication is enabled")
 		}
 		if o.AgentNamespace == "" {
-			return fmt.Errorf("AgentNamespace cannot be empty when agent authentication is enabled")
+			return fmt.Errorf("--agent-namespace cannot be empty when agent authentication is enabled")
 		}
 		if o.AgentServiceAccount == "" {
-			return fmt.Errorf("AgentServiceAccount cannot be empty when agent authentication is enabled")
+			return fmt.Errorf("--agent-service-account cannot be empty when agent authentication is enabled")
 		}
 		if o.AuthenticationAudience == "" {
-			return fmt.Errorf("AuthenticationAudience cannot be empty when agent authentication is enabled")
-		}
-		if o.KubeconfigPath != "" {
-			if _, err := os.Stat(o.KubeconfigPath); os.IsNotExist(err) {
-				return fmt.Errorf("error checking KubeconfigPath %q, got %v", o.KubeconfigPath, err)
-			}
+			return fmt.Errorf("--authentication-audience cannot be empty when agent authentication is enabled")
 		}
 	}
-
+	// Validate kubeconfig path if provided
+	if o.KubeconfigPath != "" {
+		if _, err := os.Stat(o.KubeconfigPath); os.IsNotExist(err) {
+			return fmt.Errorf("checking KubeconfigPath %q, got %v", o.KubeconfigPath, err)
+		}
+	}
 	// validate the proxy strategies
-	if o.ProxyStrategies != "" {
-		pss := strings.Split(o.ProxyStrategies, ",")
-		for _, ps := range pss {
-			switch ps {
-			case string(server.ProxyStrategyDestHost):
-			case string(server.ProxyStrategyDefault):
-			case string(server.ProxyStrategyDefaultRoute):
-			default:
-				return fmt.Errorf("unknown proxy strategy: %s, available strategy are: default, destHost, defaultRoute", ps)
-			}
-		}
+	if len(o.ProxyStrategies) == 0 {
+		return fmt.Errorf("ProxyStrategies cannot be empty")
 	}
-
+	if _, err := proxystrategies.ParseProxyStrategies(o.ProxyStrategies); err != nil {
+		return fmt.Errorf("invalid proxy strategies: %v", err)
+	}
+	if o.XfrChannelSize <= 0 {
+		return fmt.Errorf("channel size %d must be greater than 0", o.XfrChannelSize)
+	}
 	// validate the cipher suites
 	if len(o.CipherSuites) != 0 {
 		acceptedCiphers := util.GetAcceptedCiphers()
@@ -315,6 +331,15 @@ func (o *ProxyRunOptions) Validate() error {
 			}
 		}
 	}
+	// Validate labels provided.
+	if o.EnableLeaseController {
+		_, err := util.ParseLabels(o.LeaseLabel)
+		if err != nil {
+			return err
+		}
+	}
+
+	o.NeedsKubernetesClient = usingServiceAccountAuth || o.EnableLeaseController
 
 	return nil
 }
@@ -349,9 +374,14 @@ func NewProxyRunOptions() *ProxyRunOptions {
 		KubeconfigPath:            "",
 		KubeconfigQPS:             0,
 		KubeconfigBurst:           0,
+		APIContentType:            runtime.ContentTypeProtobuf,
 		AuthenticationAudience:    "",
 		ProxyStrategies:           "default",
 		CipherSuites:              make([]string, 0),
+		XfrChannelSize:            10,
+		EnableLeaseController:     false,
+		LeaseNamespace:            "kube-system",
+		LeaseLabel:                "k8s-app=konnectivity-server",
 	}
 	return &o
 }

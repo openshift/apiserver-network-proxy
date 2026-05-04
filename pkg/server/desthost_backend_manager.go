@@ -20,6 +20,7 @@ import (
 	"context"
 
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
@@ -32,17 +33,49 @@ var _ BackendManager = &DestHostBackendManager{}
 func NewDestHostBackendManager() *DestHostBackendManager {
 	return &DestHostBackendManager{
 		DefaultBackendStorage: NewDefaultBackendStorage(
-			[]header.IdentifierType{header.IPv4, header.IPv6, header.Host})}
+			[]header.IdentifierType{header.IPv4, header.IPv6, header.Host}, proxystrategies.ProxyStrategyDestHost)}
+}
+
+func (dibm *DestHostBackendManager) AddBackend(backend *Backend) {
+	agentIdentifiers := backend.GetAgentIdentifiers()
+	for _, ipv4 := range agentIdentifiers.IPv4 {
+		klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv4)
+		dibm.addBackend(ipv4, header.IPv4, backend)
+	}
+	for _, ipv6 := range agentIdentifiers.IPv6 {
+		klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv6)
+		dibm.addBackend(ipv6, header.IPv6, backend)
+	}
+	for _, host := range agentIdentifiers.Host {
+		klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", host)
+		dibm.addBackend(host, header.Host, backend)
+	}
+}
+
+func (dibm *DestHostBackendManager) RemoveBackend(backend *Backend) {
+	agentIdentifiers := backend.GetAgentIdentifiers()
+	for _, ipv4 := range agentIdentifiers.IPv4 {
+		klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv4)
+		dibm.removeBackend(ipv4, header.IPv4, backend)
+	}
+	for _, ipv6 := range agentIdentifiers.IPv6 {
+		klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv6)
+		dibm.removeBackend(ipv6, header.IPv6, backend)
+	}
+	for _, host := range agentIdentifiers.Host {
+		klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", host)
+		dibm.removeBackend(host, header.Host, backend)
+	}
 }
 
 // Backend tries to get a backend associating to the request destination host.
-func (dibm *DestHostBackendManager) Backend(ctx context.Context) (Backend, error) {
+func (dibm *DestHostBackendManager) Backend(ctx context.Context) (*Backend, error) {
 	dibm.mu.RLock()
 	defer dibm.mu.RUnlock()
 	if len(dibm.backends) == 0 {
 		return nil, &ErrNotFound{}
 	}
-	destHost := ctx.Value(destHost).(string)
+	destHost := ctx.Value(destHostKey).(string)
 	if destHost != "" {
 		bes, exist := dibm.backends[destHost]
 		if exist && len(bes) > 0 {

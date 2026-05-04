@@ -28,8 +28,6 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
 	"sigs.k8s.io/apiserver-network-proxy/tests/framework"
 )
 
@@ -39,7 +37,7 @@ type tcpLB struct {
 	backends []string
 }
 
-func copy(wc io.WriteCloser, r io.Reader) {
+func ioCopy(wc io.WriteCloser, r io.Reader) {
 	defer wc.Close()
 	io.Copy(wc, r)
 }
@@ -50,8 +48,8 @@ func (lb *tcpLB) handleConnection(in net.Conn, backend string) {
 		lb.t.Log(err)
 		return
 	}
-	go copy(out, in)
-	go copy(in, out)
+	go ioCopy(out, in)
+	go ioCopy(in, out)
 }
 
 func (lb *tcpLB) serve(stopCh chan struct{}) string {
@@ -90,6 +88,7 @@ func (lb *tcpLB) addBackend(backend string) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 	lb.backends = append(lb.backends, backend)
+
 }
 
 func (lb *tcpLB) removeBackend(backend string) {
@@ -175,8 +174,9 @@ func TestBasicHAProxyServer_GRPC(t *testing.T) {
 }
 
 func testProxyServer(t *testing.T, front string, target string) {
-	ctx := context.Background()
-	tunnel, err := client.CreateSingleUseGrpcTunnel(ctx, front, grpc.WithInsecure())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Close the tunnel
+	tunnel, err := createSingleUseGrpcTunnel(ctx, front)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,6 +194,7 @@ func testProxyServer(t *testing.T, front string, target string) {
 	}
 
 	data, err := io.ReadAll(r.Body)
+	r.Body.Close()
 	if err != nil {
 		t.Error(err)
 	}

@@ -17,12 +17,14 @@ limitations under the License.
 package metrics
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 )
 
 const (
@@ -45,17 +47,23 @@ var (
 
 // ServerMetrics includes all the metrics of the proxy server.
 type ServerMetrics struct {
-	endpointLatencies *prometheus.HistogramVec
-	frontendLatencies *prometheus.HistogramVec
-	grpcConnections   *prometheus.GaugeVec
-	httpConnections   prometheus.Gauge
-	backend           *prometheus.GaugeVec
-	pendingDials      *prometheus.GaugeVec
-	establishedConns  *prometheus.GaugeVec
-	fullRecvChannels  *prometheus.GaugeVec
-	dialFailures      *prometheus.CounterVec
-	streamPackets     *prometheus.CounterVec
-	streamErrors      *prometheus.CounterVec
+	endpointLatencies    *prometheus.HistogramVec
+	frontendLatencies    *prometheus.HistogramVec
+	grpcConnections      *prometheus.GaugeVec
+	httpConnections      prometheus.Gauge
+	backend              *prometheus.GaugeVec
+	totalBackendCount    *prometheus.GaugeVec
+	pendingDials         *prometheus.GaugeVec
+	establishedConns     *prometheus.GaugeVec
+	fullRecvChannels     *prometheus.GaugeVec
+	dialFailures         *prometheus.CounterVec
+	streamPackets        *prometheus.CounterVec
+	streamErrors         *prometheus.CounterVec
+	culledLeases         prometheus.Counter
+	leaseDeleteLatencies *prometheus.HistogramVec
+	leaseDeletes         *prometheus.CounterVec
+	leaseListLatencies   *prometheus.HistogramVec
+	leaseLists           *prometheus.CounterVec
 }
 
 // newServerMetrics create a new ServerMetrics, configured with default metric names.
@@ -104,9 +112,20 @@ func newServerMetrics() *ServerMetrics {
 			Namespace: Namespace,
 			Subsystem: Subsystem,
 			Name:      "ready_backend_connections",
-			Help:      "Number of konnectivity agent connected to the proxy server",
+			Help:      "Number of konnectivity agent connected to the proxy server. DEPRECATED, please use ready_backends",
 		},
 		[]string{},
+	)
+	totalBackendCount := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "ready_backends",
+			Help:      "Number of konnectivity agent connected to the proxy server",
+		},
+		[]string{
+			"proxy_strategy",
+		},
 	)
 	pendingDials := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -148,6 +167,48 @@ func newServerMetrics() *ServerMetrics {
 			"reason",
 		},
 	)
+	culledLeases := prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Subsystem: Subsystem,
+		Name:      "culled_leases_count",
+		Help:      "Count of expired leases that the lease garbage collection controller has culled.",
+	})
+	leaseDeleteLatencies := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "lease_delete_latency_seconds",
+			Help:      "Latency of lease deletion calls by the garbage collection controller in seconds.",
+		},
+		[]string{"http_status_code"},
+	)
+	leaseDeletes := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "lease_delete_total",
+			Help:      "Count of lease delection calls by the garbage collection controller. Labeled by HTTP status code and reason.",
+		},
+		[]string{"http_status_code", "reason"},
+	)
+	leaseListLatencies := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "lease_list_latency_seconds",
+			Help:      "Latency of lease list calls by the garbage collection controller in seconds.",
+		},
+		[]string{"http_status_code"},
+	)
+	leaseLists := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "lease_list_total",
+			Help:      "Count of lease deletion calls by the garbage collection controller. Labeled by HTTP status code and reason.",
+		},
+		[]string{"http_status_code", "reason"},
+	)
 	streamPackets := commonmetrics.MakeStreamPacketsTotalMetric(Namespace, Subsystem)
 	streamErrors := commonmetrics.MakeStreamErrorsTotalMetric(Namespace, Subsystem)
 	prometheus.MustRegister(endpointLatencies)
@@ -155,24 +216,36 @@ func newServerMetrics() *ServerMetrics {
 	prometheus.MustRegister(grpcConnections)
 	prometheus.MustRegister(httpConnections)
 	prometheus.MustRegister(backend)
+	prometheus.MustRegister(totalBackendCount)
 	prometheus.MustRegister(pendingDials)
 	prometheus.MustRegister(establishedConns)
 	prometheus.MustRegister(fullRecvChannels)
 	prometheus.MustRegister(dialFailures)
 	prometheus.MustRegister(streamPackets)
 	prometheus.MustRegister(streamErrors)
+	prometheus.MustRegister(culledLeases)
+	prometheus.MustRegister(leaseDeleteLatencies)
+	prometheus.MustRegister(leaseDeletes)
+	prometheus.MustRegister(leaseListLatencies)
+	prometheus.MustRegister(leaseLists)
 	return &ServerMetrics{
-		endpointLatencies: endpointLatencies,
-		frontendLatencies: frontendLatencies,
-		grpcConnections:   grpcConnections,
-		httpConnections:   httpConnections,
-		backend:           backend,
-		pendingDials:      pendingDials,
-		establishedConns:  establishedConns,
-		fullRecvChannels:  fullRecvChannels,
-		dialFailures:      dialFailures,
-		streamPackets:     streamPackets,
-		streamErrors:      streamErrors,
+		endpointLatencies:    endpointLatencies,
+		frontendLatencies:    frontendLatencies,
+		grpcConnections:      grpcConnections,
+		httpConnections:      httpConnections,
+		backend:              backend,
+		totalBackendCount:    totalBackendCount,
+		pendingDials:         pendingDials,
+		establishedConns:     establishedConns,
+		fullRecvChannels:     fullRecvChannels,
+		dialFailures:         dialFailures,
+		streamPackets:        streamPackets,
+		streamErrors:         streamErrors,
+		culledLeases:         culledLeases,
+		leaseDeleteLatencies: leaseDeleteLatencies,
+		leaseDeletes:         leaseDeletes,
+		leaseListLatencies:   leaseListLatencies,
+		leaseLists:           leaseLists,
 	}
 }
 
@@ -182,12 +255,18 @@ func (s *ServerMetrics) Reset() {
 	s.frontendLatencies.Reset()
 	s.grpcConnections.Reset()
 	s.backend.Reset()
+	s.totalBackendCount.Reset()
 	s.pendingDials.Reset()
 	s.establishedConns.Reset()
 	s.fullRecvChannels.Reset()
 	s.dialFailures.Reset()
 	s.streamPackets.Reset()
 	s.streamErrors.Reset()
+}
+
+// CulledLeasesInc increments the number of leases that the GC controller has culled.
+func (s *ServerMetrics) CulledLeasesInc() {
+	s.culledLeases.Inc()
 }
 
 // ObserveDialLatency records the latency of dial to the remote endpoint.
@@ -216,9 +295,14 @@ func (s *ServerMetrics) HTTPConnectionInc() { s.httpConnections.Inc() }
 // HTTPConnectionDec decrements a finished HTTP CONNECTION connection.
 func (s *ServerMetrics) HTTPConnectionDec() { s.httpConnections.Dec() }
 
-// SetBackendCount sets the number of backend connection.
-func (s *ServerMetrics) SetBackendCount(count int) {
+// SetBackendCountDeprecated sets the number of backend connection.
+func (s *ServerMetrics) SetBackendCountDeprecated(count int) {
 	s.backend.WithLabelValues().Set(float64(count))
+}
+
+// SetTotalBackendCount sets the total number of backend connection.
+func (s *ServerMetrics) SetTotalBackendCount(proxyStrategy proxystrategies.ProxyStrategy, count int) {
+	s.totalBackendCount.WithLabelValues(proxyStrategy.String()).Set(float64(count))
 }
 
 // SetPendingDialCount sets the number of pending dials.
@@ -261,4 +345,20 @@ func (s *ServerMetrics) ObserveStreamErrorNoPacket(segment commonmetrics.Segment
 
 func (s *ServerMetrics) ObserveStreamError(segment commonmetrics.Segment, err error, packetType client.PacketType) {
 	commonmetrics.ObserveStreamError(s.streamErrors, segment, err, packetType)
+}
+
+func (s *ServerMetrics) ObserveLeaseDeleteLatency(httpCode int, latency time.Duration) {
+	s.leaseDeleteLatencies.WithLabelValues(strconv.Itoa(httpCode)).Observe(latency.Seconds())
+}
+
+func (s *ServerMetrics) ObserveLeaseDelete(httpCode int, reason string) {
+	s.leaseDeletes.WithLabelValues(strconv.Itoa(httpCode), reason).Inc()
+}
+
+func (s *ServerMetrics) ObserveLeaseListLatency(httpCode int, latency time.Duration) {
+	s.leaseListLatencies.WithLabelValues(strconv.Itoa(httpCode)).Observe(latency.Seconds())
+}
+
+func (s *ServerMetrics) ObserveLeaseList(httpCode int, reason string) {
+	s.leaseLists.WithLabelValues(strconv.Itoa(httpCode), reason).Inc()
 }

@@ -30,43 +30,81 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent/metrics"
 )
 
+const (
+	fromResponses = "KNP server response headers"
+	fromLeases    = "KNP lease count"
+	fromFallback  = "fallback to 1"
+)
+
 // ClientSet consists of clients connected to each instance of an HA proxy server.
 type ClientSet struct {
-	mu      sync.Mutex         //protects the clients.
-	clients map[string]*Client // map between serverID and the client
-	// connects to this server.
+	// mu guards access to the clients map
+	mu sync.Mutex
 
-	agentID     string // ID of this agent
-	address     string // proxy server address. Assuming HA proxy server
-	serverCount int    // number of proxy server instances, should be 1
-	// unless it is an HA server. Initialized when the ClientSet creates
-	// the first client. When syncForever is set, it will be the most recently seen.
-	syncInterval time.Duration // The interval by which the agent
-	// periodically checks that it has connections to all instances of the
-	// proxy server.
-	probeInterval time.Duration // The interval by which the agent
+	// clients is a map between serverID and the client
+	// connected to this server.
+	clients map[string]*Client
+
+	// agentID is "our ID" - the ID of this agent.
+	agentID string
+
+	// Address is the proxy server address.  Assuming HA proxy server
+	address string
+
+	// serverCounter counts number of proxy server leases
+	serverCounter ServerCounter
+
+	// lastReceivedServerCount is the last serverCount value received when connecting to a proxy server
+	lastReceivedServerCount int
+
+	// syncInterval is the interval at which the agent periodically checks
+	// that it has connections to all instances of the proxy server.
+	syncInterval time.Duration
+
+	//  The maximum interval for the syncInterval to back off to when unable to connect to the proxy server
+	syncIntervalCap time.Duration
+
+	// 	syncForever is true if we should continue syncing (support dynamic server count).
+	syncForever bool
+
+	// probeInterval is the interval at which the agent
 	// periodically checks if its connections to the proxy server is ready.
-	syncIntervalCap time.Duration // The maximum interval
-	// for the syncInterval to back off to when unable to connect to the proxy server
+	probeInterval time.Duration
 
 	dialOptions []grpc.DialOption
-	// file path contains service account token
+
+	// serviceAccountTokenPath is the file path to our kubernetes service account token
 	serviceAccountTokenPath string
+
+	// channel to signal that the agent is pending termination.
+	drainCh <-chan struct{}
+
 	// channel to signal shutting down the client set. Primarily for test.
 	stopCh <-chan struct{}
 
-	agentIdentifiers string // The identifiers of the agent, which will be used
+	// agentIdentifiers is the identifiers of the agent, which will be used
 	// by the server when choosing agent
+	agentIdentifiers string
 
 	warnOnChannelLimit bool
+	xfrChannelSize     int
 
-	syncForever bool // Continue syncing (support dynamic server count).
+	// serverCountSource controls how we compute the server count.
+	// The proxy server sends the serverCount header to each connecting agent,
+	// and the agent figures out from these observations how many
+	// agent-to-proxy-server connections it should maintain.
+	serverCountSource string
 }
 
 func (cs *ClientSet) ClientsCount() int {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return len(cs.clients)
+}
+
+// SetServerCounter sets the strategy for determining the server count.
+func (cs *ClientSet) SetServerCounter(counter ServerCounter) {
+	cs.serverCounter = counter
 }
 
 func (cs *ClientSet) HealthyClientsCount() int {
@@ -82,15 +120,12 @@ func (cs *ClientSet) HealthyClientsCount() int {
 
 }
 
-func (cs *ClientSet) hasIDLocked(serverID string) bool {
-	_, ok := cs.clients[serverID]
-	return ok
-}
-
+// HasID returns true if the ClientSet has a client to the specified serverID.
 func (cs *ClientSet) HasID(serverID string) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	return cs.hasIDLocked(serverID)
+	_, exists := cs.clients[serverID]
+	return exists
 }
 
 type DuplicateServerError struct {
@@ -101,20 +136,19 @@ func (dse *DuplicateServerError) Error() string {
 	return "duplicate server: " + dse.ServerID
 }
 
-func (cs *ClientSet) addClientLocked(serverID string, c *Client) error {
-	if cs.hasIDLocked(serverID) {
+// AddClient adds the specified client to our set of clients.
+// If we already have a connection with the same serverID, we will return *DuplicateServerError.
+func (cs *ClientSet) AddClient(serverID string, c *Client) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	_, exists := cs.clients[serverID]
+	if exists {
 		return &DuplicateServerError{ServerID: serverID}
 	}
 	cs.clients[serverID] = c
 	metrics.Metrics.SetServerConnectionsCount(len(cs.clients))
 	return nil
-
-}
-
-func (cs *ClientSet) AddClient(serverID string, c *Client) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	return cs.addClientLocked(serverID, c)
 }
 
 func (cs *ClientSet) RemoveClient(serverID string) {
@@ -139,9 +173,11 @@ type ClientSetConfig struct {
 	ServiceAccountTokenPath string
 	WarnOnChannelLimit      bool
 	SyncForever             bool
+	XfrChannelSize          int
+	ServerCountSource       string
 }
 
-func (cc *ClientSetConfig) NewAgentClientSet(stopCh <-chan struct{}) *ClientSet {
+func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *ClientSet {
 	return &ClientSet{
 		clients:                 make(map[string]*Client),
 		agentID:                 cc.AgentID,
@@ -154,7 +190,10 @@ func (cc *ClientSetConfig) NewAgentClientSet(stopCh <-chan struct{}) *ClientSet 
 		serviceAccountTokenPath: cc.ServiceAccountTokenPath,
 		warnOnChannelLimit:      cc.WarnOnChannelLimit,
 		syncForever:             cc.SyncForever,
+		drainCh:                 drainCh,
+		xfrChannelSize:          cc.XfrChannelSize,
 		stopCh:                  stopCh,
+		serverCountSource:       cc.ServerCountSource,
 	}
 }
 
@@ -172,7 +211,15 @@ func (cs *ClientSet) resetBackoff() *wait.Backoff {
 	}
 }
 
-// sync makes sure that #clients >= #proxy servers
+// determineServerCount determines the number of proxy servers by delegating to its configured counter strategy.
+func (cs *ClientSet) determineServerCount() int {
+	serverCount := cs.serverCounter.Count()
+	metrics.Metrics.SetServerCount(serverCount)
+	return serverCount
+}
+
+// sync manages the backoff and the connection attempts to the proxy server.
+// sync runs until stopCh is closed
 func (cs *ClientSet) sync() {
 	defer cs.shutdown()
 	backoff := cs.resetBackoff()
@@ -180,18 +227,24 @@ func (cs *ClientSet) sync() {
 	for {
 		if err := cs.connectOnce(); err != nil {
 			if dse, ok := err.(*DuplicateServerError); ok {
-				klog.V(4).InfoS("duplicate server", "serverID", dse.ServerID, "serverCount", cs.serverCount, "clientsCount", cs.ClientsCount())
-				if cs.serverCount != 0 && cs.ClientsCount() >= cs.serverCount {
-					duration = backoff.Step()
-				}
+				klog.V(4).InfoS("duplicate server connection attempt", "serverID", dse.ServerID)
+				// We connected to a server we already have a connection to.
+				// This is expected in syncForever mode. We just wait for the
+				// next sync period to try again. No need for backoff.
+				backoff = cs.resetBackoff()
+				duration = wait.Jitter(backoff.Duration, backoff.Jitter)
 			} else {
+				// A 'real' error, so we backoff.
 				klog.ErrorS(err, "cannot connect once")
 				duration = backoff.Step()
 			}
 		} else {
+			// A successful connection was made, or no new connection was needed.
+			// Reset the backoff and wait for the next sync period.
 			backoff = cs.resetBackoff()
 			duration = wait.Jitter(backoff.Duration, backoff.Jitter)
 		}
+
 		time.Sleep(duration)
 		select {
 		case <-cs.stopCh:
@@ -202,24 +255,27 @@ func (cs *ClientSet) sync() {
 }
 
 func (cs *ClientSet) connectOnce() error {
-	if !cs.syncForever && cs.serverCount != 0 && cs.ClientsCount() >= cs.serverCount {
-		return nil
+	serverCount := cs.determineServerCount()
+
+	// If not in syncForever mode, we only connect if we have fewer connections than the server count.
+	if !cs.syncForever && cs.ClientsCount() >= serverCount && serverCount > 0 {
+		return nil // Nothing to do.
 	}
-	c, serverCount, err := cs.newAgentClient()
+
+	// In syncForever mode, we always try to connect, to discover new servers.
+	c, receivedServerCount, err := cs.newAgentClient()
 	if err != nil {
 		return err
 	}
-	if cs.serverCount != 0 && cs.serverCount != serverCount {
-		klog.V(2).InfoS("Server count change suggestion by server",
-			"current", cs.serverCount, "serverID", c.serverID, "actual", serverCount)
 
-	}
-	cs.serverCount = serverCount
 	if err := cs.AddClient(c.serverID, c); err != nil {
 		c.Close()
-		return err
+		return err // likely *DuplicateServerError
 	}
-	klog.V(2).InfoS("sync added client connecting to proxy server", "serverID", c.serverID)
+	// SUCCESS: We connected to a new, unique server.
+	// Only now do we update our view of the server count.
+	cs.lastReceivedServerCount = receivedServerCount
+	klog.V(2).InfoS("successfully connected to new proxy server", "serverID", c.serverID, "newServerCount", receivedServerCount)
 
 	labels := runpprof.Labels(
 		"agentIdentifiers", cs.agentIdentifiers,
@@ -227,6 +283,7 @@ func (cs *ClientSet) connectOnce() error {
 		"serverID", c.serverID,
 	)
 	go runpprof.Do(context.Background(), labels, func(context.Context) { c.Serve() })
+
 	return nil
 }
 

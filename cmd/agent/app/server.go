@@ -24,10 +24,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"os/signal"
 	"runtime"
 	runpprof "runtime/pprof"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -35,21 +38,31 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	coordinationv1lister "k8s.io/client-go/listers/coordination/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
-
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/agent/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
-const ReadHeaderTimeout = 60 * time.Second
+const (
+	ReadHeaderTimeout   = 60 * time.Second
+	LeaseInformerResync = time.Second * 10
+)
 
 func NewAgentCommand(a *Agent, o *options.GrpcProxyAgentOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:  "agent",
 		Long: `A gRPC agent, Connects to the proxy and then allows traffic to be forwarded to it.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.run(o)
+		RunE: func(_ *cobra.Command, _ []string) error {
+			drainCh, stopCh := SetupSignalHandler()
+			return a.Run(o, drainCh, stopCh)
 		},
 	}
 
@@ -57,35 +70,65 @@ func NewAgentCommand(a *Agent, o *options.GrpcProxyAgentOptions) *cobra.Command 
 }
 
 type Agent struct {
+	adminServer  *http.Server
+	healthServer *http.Server
+
+	cs *agent.ClientSet
 }
 
-func (a *Agent) run(o *options.GrpcProxyAgentOptions) error {
+func (a *Agent) Run(o *options.GrpcProxyAgentOptions, drainCh, stopCh <-chan struct{}) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
 		return fmt.Errorf("failed to validate agent options with %v", err)
 	}
 
-	stopCh := make(chan struct{})
-
-	cs, err := a.runProxyConnection(o, stopCh)
+	cs, err := a.runProxyConnection(o, drainCh, stopCh)
 	if err != nil {
 		return fmt.Errorf("failed to run proxy connection with %v", err)
 	}
+	a.cs = cs
 
 	if err := a.runHealthServer(o, cs); err != nil {
 		return fmt.Errorf("failed to run health server with %v", err)
 	}
+	defer a.healthServer.Close()
 
 	if err := a.runAdminServer(o); err != nil {
 		return fmt.Errorf("failed to run admin server with %v", err)
 	}
+	defer a.adminServer.Close()
 
 	<-stopCh
+	klog.V(1).Infoln("Shutting down agent.")
 
 	return nil
 }
 
-func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, stopCh <-chan struct{}) (agent.ReadinessManager, error) {
+var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
+
+func SetupSignalHandler() (drainCh, stopCh <-chan struct{}) {
+	drain := make(chan struct{})
+	stop := make(chan struct{})
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, shutdownSignals...)
+	labels := runpprof.Labels(
+		"core", "signalHandler",
+	)
+	go runpprof.Do(context.Background(), labels, func(context.Context) { handleSignals(c, drain, stop) })
+
+	return drain, stop
+}
+
+func handleSignals(signalCh chan os.Signal, drainCh, stopCh chan struct{}) {
+	s := <-signalCh
+	klog.V(2).InfoS("Received first signal", "signal", s)
+	close(drainCh)
+	s = <-signalCh
+	klog.V(2).InfoS("Received second signal", "signal", s)
+	close(stopCh)
+}
+
+func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, drainCh, stopCh <-chan struct{}) (*agent.ClientSet, error) {
 	var tlsConfig *tls.Config
 	var err error
 	if tlsConfig, err = util.GetClientTLSConfig(o.CaCert, o.AgentCert, o.AgentKey, o.ProxyServerHost, o.AlpnProtos); err != nil {
@@ -99,14 +142,53 @@ func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, stopCh <-ch
 		}),
 	}
 	cc := o.ClientSetConfig(dialOptions...)
-	cs := cc.NewAgentClientSet(stopCh)
+
+	var leaseCounter agent.ServerCounter
+	if o.CountServerLeases {
+		var config *rest.Config
+		if o.KubeconfigPath != "" {
+			config, err = clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load kubernetes client config: %v", err)
+			}
+		} else {
+			config, err = rest.InClusterConfig()
+			if err != nil {
+				return nil, fmt.Errorf("failed to load in cluster kubernetes client config: %w", err)
+			}
+		}
+		config.ContentType = o.APIContentType
+
+		k8sClient, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create kubernetes clientset: %v", err)
+		}
+		leaseInformer := agent.NewLeaseInformerWithMetrics(k8sClient, o.LeaseNamespace, LeaseInformerResync)
+		go leaseInformer.Run(stopCh)
+		cache.WaitForCacheSync(stopCh, leaseInformer.HasSynced)
+		leaseLister := coordinationv1lister.NewLeaseLister(leaseInformer.GetIndexer())
+		serverLeaseSelector, _ := labels.Parse(o.LeaseLabel)
+		leaseCounter = agent.NewServerLeaseCounter(
+			clock.RealClock{},
+			leaseLister,
+			serverLeaseSelector,
+		)
+	}
+
+	cs := cc.NewAgentClientSet(drainCh, stopCh)
+	// Always create the response-based counter.
+	responseCounter := agent.NewResponseBasedCounter(cs)
+	// Create the aggregate counter which acts as the master strategy.
+	aggregateCounter := agent.NewAggregateServerCounter(leaseCounter, responseCounter, o.ServerCountSource)
+	cs.SetServerCounter(aggregateCounter)
+
 	cs.Serve()
 
 	return cs, nil
 }
 
 func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.ReadinessManager) error {
-	livenessHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	livenessHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "ok")
 	})
 
@@ -125,9 +207,9 @@ func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.Readi
 
 		// Always be verbose if the check has failed
 		if len(failedChecks) > 0 {
-			klog.V(0).Infoln("%s check failed: \n%v", strings.Join(failedChecks, ","), individualCheckOutput.String())
+			klog.V(0).Infof("%s check failed: \n%v", strings.Join(failedChecks, ","), individualCheckOutput.String())
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, individualCheckOutput.String())
+			fmt.Fprint(w, individualCheckOutput.String())
 			return
 		}
 
@@ -149,7 +231,7 @@ func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.Readi
 	// "/ready" is deprecated but being maintained for backward compatibility
 	muxHandler.HandleFunc("/ready", readinessHandler)
 	muxHandler.HandleFunc("/readyz", readinessHandler)
-	healthServer := &http.Server{
+	a.healthServer = &http.Server{
 		Addr:              net.JoinHostPort(o.HealthServerHost, strconv.Itoa(o.HealthServerPort)),
 		Handler:           muxHandler,
 		MaxHeaderBytes:    1 << 20,
@@ -160,7 +242,7 @@ func (a *Agent) runHealthServer(o *options.GrpcProxyAgentOptions, cs agent.Readi
 		"core", "healthListener",
 		"port", strconv.Itoa(o.HealthServerPort),
 	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveHealth(healthServer) })
+	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveHealth(a.healthServer) })
 
 	return nil
 }
@@ -197,7 +279,7 @@ func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 		}
 	}
 
-	adminServer := &http.Server{
+	a.adminServer = &http.Server{
 		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminServerPort)),
 		Handler:           muxHandler,
 		MaxHeaderBytes:    1 << 20,
@@ -208,7 +290,7 @@ func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 		"core", "adminListener",
 		"port", strconv.Itoa(o.AdminServerPort),
 	)
-	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveAdmin(adminServer) })
+	go runpprof.Do(context.Background(), labels, func(context.Context) { a.serveAdmin(a.adminServer) })
 
 	return nil
 }
@@ -219,4 +301,9 @@ func (a *Agent) serveAdmin(adminServer *http.Server) {
 		klog.ErrorS(err, "admin server could not listen")
 	}
 	klog.V(0).Infoln("Admin server stopped listening")
+}
+
+// ClientSet exposes internal state for testing.
+func (a *Agent) ClientSet() *agent.ClientSet {
+	return a.cs
 }

@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/metadata"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -39,10 +39,13 @@ import (
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	metricstest "sigs.k8s.io/apiserver-network-proxy/pkg/testing/metrics"
 	agentmock "sigs.k8s.io/apiserver-network-proxy/proto/agent/mocks"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
+
+const xfrChannelSize = 10
 
 func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 	stub := gomock.NewController(t)
@@ -135,7 +138,7 @@ func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			kcs := k8sfake.NewSimpleClientset()
 
-			kcs.AuthenticationV1().(*fakeauthenticationv1.FakeAuthenticationV1).Fake.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			kcs.AuthenticationV1().(*fakeauthenticationv1.FakeAuthenticationV1).Fake.PrependReactor("create", "tokenreviews", func(_ k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 				tr := &authv1.TokenReview{
 					Status: authv1.TokenReviewStatus{
 						Authenticated: tc.authenticated,
@@ -167,12 +170,12 @@ func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 				conn.EXPECT().Recv().Return(nil, io.EOF)
 			}
 
-			p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{
+			p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{
 				Enabled:             true,
 				KubernetesClient:    kcs,
 				AgentNamespace:      tc.wantNamespace,
 				AgentServiceAccount: tc.wantServiceAccount,
-			})
+			}, xfrChannelSize)
 
 			err := p.Connect(conn)
 			if tc.wantError {
@@ -195,7 +198,7 @@ func TestRemovePendingDialForStream(t *testing.T) {
 	pending3 := &ProxyClientConnection{frontend: &GrpcFrontend{streamUID: streamUID}}
 	pending4 := &ProxyClientConnection{frontend: &GrpcFrontend{streamUID: "different-uid"}}
 	pending5 := &ProxyClientConnection{frontend: &GrpcFrontend{streamUID: ""}}
-	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.PendingDial.Add(1, pending1)
 	p.PendingDial.Add(2, pending2)
 	p.PendingDial.Add(3, pending3)
@@ -223,7 +226,7 @@ func TestAddRemoveFrontends(t *testing.T) {
 	agent2ConnID2 := new(ProxyClientConnection)
 	agent3ConnID1 := new(ProxyClientConnection)
 
-	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.addEstablished("agent1", int64(1), agent1ConnID1)
 	p.removeEstablished("agent1", int64(1))
 	expectedFrontends := make(map[string]map[int64]*ProxyClientConnection)
@@ -231,7 +234,7 @@ func TestAddRemoveFrontends(t *testing.T) {
 		t.Errorf("expected %v, got %v", e, a)
 	}
 
-	p = NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p = NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.addEstablished("agent1", int64(1), agent1ConnID1)
 	p.addEstablished("agent1", int64(2), agent1ConnID2)
 	p.addEstablished("agent2", int64(1), agent2ConnID1)
@@ -253,6 +256,260 @@ func TestAddRemoveFrontends(t *testing.T) {
 	}
 }
 
+func TestAddRemoveBackends_DefaultStrategy(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{}))
+	backend3, _ := NewBackend(mockAgentConn(ctrl, "agent3", []string{}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+
+	p.addBackend(backend2)
+	p.addBackend(backend3)
+	p.removeBackend(backend1)
+	p.removeBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestAddRemoveBackends_DefaultRouteStrategy(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{"default-route=false"}))
+	backend3, _ := NewBackend(mockAgentConn(ctrl, "agent3", []string{"default-route=true"}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefaultRoute}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+
+	p.addBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+
+	p.addBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend1)
+	p.removeBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestAddRemoveBackends_DestHostStrategy(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{"host=localhost&host=node1.mydomain.com&ipv4=1.2.3.4&ipv6=9878::7675:1292:9183:7562"}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{"default-route=true"}))
+	backend3, _ := NewBackend(mockAgentConn(ctrl, "agent3", []string{"host=node2.mydomain.com&ipv4=5.6.7.8&ipv6=::"}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDestHost}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+	p.addBackend(backend2)
+	p.addBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+	if got, _ := p.getBackend("localhost"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("node1.mydomain.com"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("1.2.3.4"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("9878::7675:1292:9183:7562"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("node2.mydomain.com"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+	if got, _ := p.getBackend("5.6.7.8"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+	if got, _ := p.getBackend("::"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend1)
+	p.removeBackend(backend2)
+	p.removeBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestAddRemoveBackends_DestHostSanitizeRequest(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{"host=localhost&host=node1.mydomain.com&ipv4=1.2.3.4&ipv6=9878::7675:1292:9183:7562"}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{"host=node2.mydomain.com&ipv4=5.6.7.8&ipv6=::"}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDestHost}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+	p.addBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1:443"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+	if got, _ := p.getBackend("node1.mydomain.com:443"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("node2.mydomain.com:443"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+}
+
+func TestAddRemoveBackends_DestHostWithDefault(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{"host=localhost&host=node1.mydomain.com&ipv4=1.2.3.4&ipv6=9878::7675:1292:9183:7562"}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{"default-route=false"}))
+	backend3, _ := NewBackend(mockAgentConn(ctrl, "agent3", []string{"host=node2.mydomain.com&ipv4=5.6.7.8&ipv6=::"}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDestHost, proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+	p.addBackend(backend2)
+	p.addBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got == nil {
+		t.Errorf("expected random fallback, got nil")
+	}
+	if got, _ := p.getBackend("localhost"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("node1.mydomain.com"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("1.2.3.4"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("9878::7675:1292:9183:7562"); got != backend1 {
+		t.Errorf("expected %v, got %v", backend1, got)
+	}
+	if got, _ := p.getBackend("node2.mydomain.com"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+	if got, _ := p.getBackend("5.6.7.8"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+	if got, _ := p.getBackend("::"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend1)
+	p.removeBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend3 {
+		t.Errorf("expected %v, got %v", backend3, got)
+	}
+
+	p.removeBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestAddRemoveBackends_DestHostWithDuplicateIdents(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	backend1, _ := NewBackend(mockAgentConn(ctrl, "agent1", []string{"host=localhost&host=node1.mydomain.com&ipv4=1.2.3.4&ipv6=9878::7675:1292:9183:7562"}))
+	backend2, _ := NewBackend(mockAgentConn(ctrl, "agent2", []string{"host=localhost&host=node1.mydomain.com&ipv4=1.2.3.4&ipv6=9878::7675:1292:9183:7562"}))
+	backend3, _ := NewBackend(mockAgentConn(ctrl, "agent3", []string{"host=localhost&host=node2.mydomain.com&ipv4=5.6.7.8&ipv6=::"}))
+
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDestHost, proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
+
+	p.addBackend(backend1)
+	p.addBackend(backend2)
+	p.addBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got == nil {
+		t.Errorf("expected random fallback, got nil")
+	}
+	if got, _ := p.getBackend("localhost"); got == nil {
+		t.Errorf("expected any backend, got nil")
+	}
+
+	p.removeBackend(backend1)
+	p.removeBackend(backend3)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("localhost"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("node1.mydomain.com"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("1.2.3.4"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("9878::7675:1292:9183:7562"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("node2.mydomain.com"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("5.6.7.8"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+	if got, _ := p.getBackend("::"); got != backend2 {
+		t.Errorf("expected %v, got %v", backend2, got)
+	}
+
+	p.removeBackend(backend2)
+
+	if got, _ := p.getBackend("127.0.0.1"); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
 func TestEstablishedConnsMetric(t *testing.T) {
 	metrics.Metrics.Reset()
 
@@ -262,7 +519,7 @@ func TestEstablishedConnsMetric(t *testing.T) {
 	agent2ConnID2 := new(ProxyClientConnection)
 	agent3ConnID1 := new(ProxyClientConnection)
 
-	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.addEstablished("agent1", int64(1), agent1ConnID1)
 	assertEstablishedConnsMetric(t, 1)
 	p.addEstablished("agent1", int64(2), agent1ConnID2)
@@ -286,15 +543,15 @@ func TestEstablishedConnsMetric(t *testing.T) {
 }
 
 func TestRemoveEstablishedForBackendConn(t *testing.T) {
-	backend1 := &backend{}
-	backend2 := &backend{}
-	backend3 := &backend{}
+	backend1 := &Backend{}
+	backend2 := &Backend{}
+	backend3 := &Backend{}
 	agent1ConnID1 := &ProxyClientConnection{backend: backend1}
 	agent1ConnID2 := &ProxyClientConnection{backend: backend1}
 	agent2ConnID1 := &ProxyClientConnection{backend: backend2}
 	agent2ConnID2 := &ProxyClientConnection{backend: backend2}
 	agent3ConnID1 := &ProxyClientConnection{backend: backend3}
-	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.addEstablished("agent1", int64(1), agent1ConnID1)
 	p.addEstablished("agent1", int64(2), agent1ConnID2)
 	p.addEstablished("agent2", int64(1), agent2ConnID1)
@@ -317,15 +574,15 @@ func TestRemoveEstablishedForBackendConn(t *testing.T) {
 
 func TestRemoveEstablishedForStream(t *testing.T) {
 	streamUID := "target-uuid"
-	backend1 := &backend{}
-	backend2 := &backend{}
-	backend3 := &backend{}
+	backend1 := &Backend{}
+	backend2 := &Backend{}
+	backend3 := &Backend{}
 	agent1ConnID1 := &ProxyClientConnection{backend: backend1, frontend: &GrpcFrontend{streamUID: streamUID}}
 	agent1ConnID2 := &ProxyClientConnection{backend: backend1}
 	agent2ConnID1 := &ProxyClientConnection{backend: backend2, frontend: &GrpcFrontend{streamUID: streamUID}}
 	agent2ConnID2 := &ProxyClientConnection{backend: backend2}
 	agent3ConnID1 := &ProxyClientConnection{backend: backend3, frontend: &GrpcFrontend{streamUID: streamUID}}
-	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1, nil)
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
 	p.addEstablished("agent1", int64(1), agent1ConnID1)
 	p.addEstablished("agent1", int64(2), agent1ConnID2)
 	p.addEstablished("agent2", int64(1), agent2ConnID1)
@@ -359,14 +616,17 @@ func prepareFrontendConn(ctrl *gomock.Controller) *agentmock.MockAgentService_Co
 	return frontendConn
 }
 
-func prepareAgentConnMD(t testing.TB, ctrl *gomock.Controller, proxyServer *ProxyServer) (*agentmock.MockAgentService_ConnectServer, Backend) {
+func prepareAgentConnMD(t testing.TB, ctrl *gomock.Controller, proxyServer *ProxyServer, agentidentifiers []string) (*agentmock.MockAgentService_ConnectServer, *Backend) {
 	t.Helper()
+	if agentidentifiers == nil {
+		agentidentifiers = []string{}
+	}
 	// prepare the the connection to agent of proxy-server
 	agentConn := agentmock.NewMockAgentService_ConnectServer(ctrl)
 	agentConnMD := metadata.MD{
 		":authority":       []string{"127.0.0.1:8091"},
 		"agentid":          []string{uuid.New().String()},
-		"agentidentifiers": []string{},
+		"agentidentifiers": agentidentifiers,
 		"content-type":     []string{"application/grpc"},
 		"user-agent":       []string{"grpc-go/1.42.0"},
 	}
@@ -385,7 +645,7 @@ func baseServerProxyTestWithoutBackend(t *testing.T, validate func(*agentmock.Mo
 	defer ctrl.Finish()
 
 	frontendConn := prepareFrontendConn(ctrl)
-	proxyServer := NewProxyServer(uuid.New().String(), []ProxyStrategy{ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{})
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
 
 	validate(frontendConn)
 
@@ -399,9 +659,9 @@ func baseServerProxyTestWithBackend(t *testing.T, validate func(*agentmock.MockA
 	frontendConn := prepareFrontendConn(ctrl)
 
 	// prepare proxy server
-	proxyServer := NewProxyServer(uuid.New().String(), []ProxyStrategy{ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{})
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
 
-	agentConn, _ := prepareAgentConnMD(t, ctrl, proxyServer)
+	agentConn, _ := prepareAgentConnMD(t, ctrl, proxyServer, nil)
 
 	validate(frontendConn, agentConn)
 
@@ -442,7 +702,7 @@ func TestServerProxyNoBackend(t *testing.T) {
 	}
 	baseServerProxyTestWithoutBackend(t, validate)
 
-	if err := metricstest.ExpectServerDialFailure(metrics.DialFailureNoAgent, 1); err != nil {
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureNoAgent, 1); err != nil {
 		t.Error(err)
 	}
 }
@@ -553,7 +813,7 @@ func TestServerProxyRecvChanFull(t *testing.T) {
 }
 
 func TestServerProxyNoDial(t *testing.T) {
-	baseServerProxyTestWithBackend(t, func(frontendConn, agentConn *agentmock.MockAgentService_ConnectServer) {
+	baseServerProxyTestWithBackend(t, func(frontendConn, _ *agentmock.MockAgentService_ConnectServer) {
 		const connectID = 123456
 		data := &client.Packet{
 			Type: client.PacketType_DATA,
@@ -605,14 +865,35 @@ func TestReadyBackendsMetric(t *testing.T) {
 
 	metrics.Metrics.Reset()
 
-	p := NewProxyServer(uuid.New().String(), []ProxyStrategy{ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{})
+	p := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
 	assertReadyBackendsMetric(t, 0)
 
-	_, backend := prepareAgentConnMD(t, ctrl, p)
+	_, backend := prepareAgentConnMD(t, ctrl, p, nil)
 	assertReadyBackendsMetric(t, 1)
 
 	p.removeBackend(backend)
 	assertReadyBackendsMetric(t, 0)
+}
+
+func TestTotalReadyBackendsMetric(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	metrics.Metrics.Reset()
+
+	p := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault, proxystrategies.ProxyStrategyDestHost}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	assertTotalReadyBackendsMetric(t, map[string]int{proxystrategies.ProxyStrategyDefault.String(): 0, proxystrategies.ProxyStrategyDestHost.String(): 0})
+
+	_, backend1 := prepareAgentConnMD(t, ctrl, p, nil)
+	assertTotalReadyBackendsMetric(t, map[string]int{proxystrategies.ProxyStrategyDefault.String(): 1, proxystrategies.ProxyStrategyDestHost.String(): 0})
+
+	// Add a backend with IPv4 agent identifier.
+	_, backend2 := prepareAgentConnMD(t, ctrl, p, []string{"host=localhost"})
+	assertTotalReadyBackendsMetric(t, map[string]int{proxystrategies.ProxyStrategyDefault.String(): 2, proxystrategies.ProxyStrategyDestHost.String(): 1})
+
+	p.removeBackend(backend1)
+	p.removeBackend(backend2)
+	assertTotalReadyBackendsMetric(t, map[string]int{proxystrategies.ProxyStrategyDefault.String(): 0, proxystrategies.ProxyStrategyDestHost.String(): 0})
 }
 
 func dialReqPkt(dialID int64) *client.Packet {
@@ -664,15 +945,22 @@ func closeRspPkt(connectID int64, errMsg string) *client.Packet {
 
 func assertEstablishedConnsMetric(t testing.TB, expect int) {
 	t.Helper()
-	if err := metricstest.ExpectServerEstablishedConns(expect); err != nil {
+	if err := metricstest.DefaultTester.ExpectServerEstablishedConns(expect); err != nil {
 		t.Errorf("Expected %d %s metric: %v", expect, "established_connections", err)
 	}
 }
 
 func assertReadyBackendsMetric(t testing.TB, expect int) {
 	t.Helper()
-	if err := metricstest.ExpectServerReadyBackends(expect); err != nil {
+	if err := metricstest.DefaultTester.ExpectServerReadyBackends(expect); err != nil {
 		t.Errorf("Expected %d %s metric: %v", expect, "ready_backend_connections", err)
+	}
+}
+
+func assertTotalReadyBackendsMetric(t testing.TB, expect map[string]int) {
+	t.Helper()
+	if err := metricstest.DefaultTester.ExpectServerTotalReadyBackends(expect); err != nil {
+		t.Errorf("Expected %s metric for each proxy strategy %+v, but got error: %v", "ready_backends", expect, err)
 	}
 }
 

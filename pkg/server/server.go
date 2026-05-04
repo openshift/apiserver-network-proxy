@@ -40,14 +40,12 @@ import (
 
 	commonmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
-
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
-
-const xfrChannelSize = 10
 
 type key int
 
@@ -87,6 +85,11 @@ func (g *GrpcFrontend) Recv() (*client.Packet, error) {
 	return pkt, nil
 }
 
+const (
+	ModeGRPC        = "grpc"
+	ModeHTTPConnect = "http-connect"
+)
+
 type ProxyClientConnection struct {
 	Mode        string
 	HTTP        io.ReadWriter
@@ -97,20 +100,67 @@ type ProxyClientConnection struct {
 	connectID   int64
 	agentID     string
 	start       time.Time
-	backend     Backend
+	backend     *Backend
 	dialAddress string // cached for logging
 }
 
 const (
-	destHost key = iota
+	destHostKey key = iota
 )
+
+// mapDialErrorToHTTPStatus maps common TCP/network error strings to appropriate HTTP status codes
+func mapDialErrorToHTTPStatus(errStr string) int {
+	// Convert to lowercase for case-insensitive matching
+	errLower := strings.ToLower(errStr)
+
+	// Check each error pattern and return appropriate status code
+	switch {
+	// Timeouts - backend didn't respond in time -> 504 Gateway Timeout
+	case strings.Contains(errLower, "i/o timeout"),
+		strings.Contains(errLower, "deadline exceeded"),
+		strings.Contains(errLower, "context deadline exceeded"),
+		strings.Contains(errLower, "timeout"):
+		return 504
+
+	// Resource exhaustion errors -> 503 Service Unavailable
+	case strings.Contains(errLower, "too many open files"),
+		strings.Contains(errLower, "socket: too many open files"):
+		return 503
+
+	// Connection errors -> 502 Bad Gateway
+	case strings.Contains(errLower, "connection refused"),
+		strings.Contains(errLower, "connection reset by peer"),
+		strings.Contains(errLower, "broken pipe"),
+		strings.Contains(errLower, "network is unreachable"),
+		strings.Contains(errLower, "no route to host"),
+		strings.Contains(errLower, "host is unreachable"),
+		strings.Contains(errLower, "network is down"):
+		return 502
+
+	// DNS resolution failures -> 502 Bad Gateway
+	case strings.Contains(errLower, "no such host"),
+		strings.Contains(errLower, "name resolution"),
+		strings.Contains(errLower, "lookup") && strings.Contains(errLower, "no such host"):
+		return 502
+
+	// TLS/SSL errors -> 502 Bad Gateway
+	case strings.Contains(errLower, "tls"),
+		strings.Contains(errLower, "ssl"),
+		strings.Contains(errLower, "certificate"):
+		return 502
+
+	// Default to 502 Bad Gateway for unknown proxy errors
+	default:
+		return 502
+	}
+}
 
 func (c *ProxyClientConnection) send(pkt *client.Packet) error {
 	defer func(start time.Time) { metrics.Metrics.ObserveFrontendWriteLatency(time.Since(start)) }(time.Now())
-	if c.Mode == "grpc" {
+	if c.Mode == ModeGRPC {
 		return c.frontend.Send(pkt)
 	}
-	if c.Mode == "http-connect" {
+	if c.Mode == ModeHTTPConnect {
 		if pkt.Type == client.PacketType_CLOSE_RSP {
 			return c.CloseHTTP()
 		} else if pkt.Type == client.PacketType_DIAL_CLS {
@@ -119,20 +169,29 @@ func (c *ProxyClientConnection) send(pkt *client.Packet) error {
 			_, err := c.HTTP.Write(pkt.GetData().Data)
 			return err
 		} else if pkt.Type == client.PacketType_DIAL_RSP {
-			if pkt.GetDialResponse().Error != "" {
-				body := bytes.NewBufferString(pkt.GetDialResponse().Error)
+			dialErr := pkt.GetDialResponse().Error
+			if dialErr != "" {
+				// // Map the error to appropriate HTTP status code
+				statusCode := mapDialErrorToHTTPStatus(dialErr)
+				statusText := http.StatusText(statusCode)
+				body := bytes.NewBufferString(dialErr)
 				t := http.Response{
-					StatusCode: 503,
+					StatusCode: statusCode,
+					Status:     fmt.Sprintf("%d %s", statusCode, statusText),
 					Body:       io.NopCloser(body),
+					Header: http.Header{
+						"Content-Type": []string{"text/plain; charset=utf-8"},
+					},
+					Proto:      "HTTP/1.1",
+					ProtoMinor: 1,
 				}
 
 				t.Write(c.HTTP)
 				return c.CloseHTTP()
 			}
 			return nil
-		} else {
-			return fmt.Errorf("attempt to send via unrecognized connection type %v", pkt.Type)
 		}
+		return fmt.Errorf("attempt to send via unrecognized connection type %v", pkt.Type)
 	}
 	return fmt.Errorf("attempt to send via unrecognized connection mode %q", c.Mode)
 }
@@ -211,7 +270,9 @@ type ProxyServer struct {
 	// agent authentication
 	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
 
-	proxyStrategies []ProxyStrategy
+	// TODO: move strategies into BackendStorage
+	proxyStrategies []proxystrategies.ProxyStrategy
+	xfrChannelSize  int
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -227,19 +288,19 @@ var _ agent.AgentServiceServer = &ProxyServer{}
 
 var _ client.ProxyServiceServer = &ProxyServer{}
 
-func genContext(proxyStrategies []ProxyStrategy, reqHost string) context.Context {
+func genContext(proxyStrategies []proxystrategies.ProxyStrategy, reqHost string) context.Context {
 	ctx := context.Background()
 	for _, ps := range proxyStrategies {
 		switch ps {
-		case ProxyStrategyDestHost:
+		case proxystrategies.ProxyStrategyDestHost:
 			addr := util.RemovePortFromHost(reqHost)
-			ctx = context.WithValue(ctx, destHost, addr)
+			ctx = context.WithValue(ctx, destHostKey, addr)
 		}
 	}
 	return ctx
 }
 
-func (s *ProxyServer) getBackend(reqHost string) (Backend, error) {
+func (s *ProxyServer) getBackend(reqHost string) (*Backend, error) {
 	ctx := genContext(s.proxyStrategies, reqHost)
 	for _, bm := range s.BackendManagers {
 		be, err := bm.Backend(ctx)
@@ -255,66 +316,16 @@ func (s *ProxyServer) getBackend(reqHost string) (Backend, error) {
 	return nil, &ErrNotFound{}
 }
 
-func (s *ProxyServer) addBackend(backend Backend) {
-	agentID := backend.GetAgentID()
-	for i := 0; i < len(s.BackendManagers); i++ {
-		switch s.BackendManagers[i].(type) {
-		case *DestHostBackendManager:
-			agentIdentifiers := backend.GetAgentIdentifiers()
-			for _, ipv4 := range agentIdentifiers.IPv4 {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv4)
-				s.BackendManagers[i].AddBackend(ipv4, header.IPv4, backend)
-			}
-			for _, ipv6 := range agentIdentifiers.IPv6 {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv6)
-				s.BackendManagers[i].AddBackend(ipv6, header.IPv6, backend)
-			}
-			for _, host := range agentIdentifiers.Host {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", host)
-				s.BackendManagers[i].AddBackend(host, header.Host, backend)
-			}
-		case *DefaultRouteBackendManager:
-			agentIdentifiers := backend.GetAgentIdentifiers()
-			if agentIdentifiers.DefaultRoute {
-				klog.V(5).InfoS("Add the agent to DefaultRouteBackendManager", "agentID", agentID)
-				s.BackendManagers[i].AddBackend(agentID, header.DefaultRoute, backend)
-			}
-		default:
-			klog.V(5).InfoS("Add the agent to DefaultBackendManager", "agentID", agentID)
-			s.BackendManagers[i].AddBackend(agentID, header.UID, backend)
-		}
+func (s *ProxyServer) addBackend(backend *Backend) {
+	// TODO: refactor BackendStorage to acquire lock once, not up to 3 times.
+	for _, bm := range s.BackendManagers {
+		bm.AddBackend(backend)
 	}
-	return
 }
 
-func (s *ProxyServer) removeBackend(backend Backend) {
-	agentID := backend.GetAgentID()
+func (s *ProxyServer) removeBackend(backend *Backend) {
 	for _, bm := range s.BackendManagers {
-		switch bm.(type) {
-		case *DestHostBackendManager:
-			agentIdentifiers := backend.GetAgentIdentifiers()
-			for _, ipv4 := range agentIdentifiers.IPv4 {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv4)
-				bm.RemoveBackend(ipv4, header.IPv4, backend)
-			}
-			for _, ipv6 := range agentIdentifiers.IPv6 {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv6)
-				bm.RemoveBackend(ipv6, header.IPv6, backend)
-			}
-			for _, host := range agentIdentifiers.Host {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", host)
-				bm.RemoveBackend(host, header.Host, backend)
-			}
-		case *DefaultRouteBackendManager:
-			agentIdentifiers := backend.GetAgentIdentifiers()
-			if agentIdentifiers.DefaultRoute {
-				klog.V(5).InfoS("Remove the agent from the DefaultRouteBackendManager", "agentID", agentID)
-				bm.RemoveBackend(agentID, header.DefaultRoute, backend)
-			}
-		default:
-			klog.V(5).InfoS("Remove the agent from the DefaultBackendManager", "agentID", agentID)
-			bm.RemoveBackend(agentID, header.UID, backend)
-		}
+		bm.RemoveBackend(backend)
 	}
 }
 
@@ -362,7 +373,7 @@ func (s *ProxyServer) getFrontend(agentID string, connID int64) (*ProxyClientCon
 	return conn, nil
 }
 
-func (s *ProxyServer) removeEstablishedForBackendConn(agentID string, backend Backend) ([]*ProxyClientConnection, error) {
+func (s *ProxyServer) removeEstablishedForBackendConn(agentID string, backend *Backend) ([]*ProxyClientConnection, error) {
 	var ret []*ProxyClientConnection
 	if backend == nil {
 		return ret, nil
@@ -420,15 +431,15 @@ func (s *ProxyServer) removeEstablishedForStream(streamUID string) []*ProxyClien
 }
 
 // NewProxyServer creates a new ProxyServer instance
-func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCount int, agentAuthenticationOptions *AgentTokenAuthenticationOptions) *ProxyServer {
+func NewProxyServer(serverID string, proxyStrategies []proxystrategies.ProxyStrategy, serverCount int, agentAuthenticationOptions *AgentTokenAuthenticationOptions, channelSize int) *ProxyServer {
 	var bms []BackendManager
 	for _, ps := range proxyStrategies {
 		switch ps {
-		case ProxyStrategyDestHost:
+		case proxystrategies.ProxyStrategyDestHost:
 			bms = append(bms, NewDestHostBackendManager())
-		case ProxyStrategyDefault:
+		case proxystrategies.ProxyStrategyDefault:
 			bms = append(bms, NewDefaultBackendManager())
-		case ProxyStrategyDefaultRoute:
+		case proxystrategies.ProxyStrategyDefaultRoute:
 			bms = append(bms, NewDefaultRouteBackendManager())
 		default:
 			klog.ErrorS(nil, "Unknown proxy strategy", "strategy", ps)
@@ -445,6 +456,7 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		// use the first backend-manager as the Readiness Manager
 		Readiness:       bms[0],
 		proxyStrategies: proxyStrategies,
+		xfrChannelSize:  channelSize,
 	}
 }
 
@@ -461,7 +473,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	streamUID := uuid.New().String()
 	klog.V(5).InfoS("Proxy request from client", "userAgent", userAgent, "serverID", s.serverID, "streamUID", streamUID)
 
-	recvCh := make(chan *client.Packet, xfrChannelSize)
+	recvCh := make(chan *client.Packet, s.xfrChannelSize)
 	stopCh := make(chan error, 1)
 
 	frontend := GrpcFrontend{
@@ -536,7 +548,7 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 	// backend from the BackendManger then.
 	// TODO: either add agentID to protocol (DATA, CLOSE_RSP, etc) or replace {agentID,
 	// connectionID} with a simpler key (#462).
-	var backend Backend
+	var backend *Backend
 	var err error
 
 	defer func() {
@@ -764,7 +776,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 	}
 	agentID := backend.GetAgentID()
 
-	klog.V(5).InfoS("Connect request from agent", "agentID", agentID, "serverID", s.serverID)
+	klog.V(2).InfoS("Connect request from agent", "agentID", agentID, "serverID", s.serverID)
 	labels := runpprof.Labels(
 		"serverCount", strconv.Itoa(s.serverCount),
 		"agentID", agentID,
@@ -789,7 +801,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 	s.addBackend(backend)
 	defer s.removeBackend(backend)
 
-	recvCh := make(chan *client.Packet, xfrChannelSize)
+	recvCh := make(chan *client.Packet, s.xfrChannelSize)
 
 	go runpprof.Do(context.Background(), labels, func(context.Context) { s.serveRecvBackend(backend, agentID, recvCh) })
 
@@ -803,7 +815,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 	return <-stopCh
 }
 
-func (s *ProxyServer) readBackendToChannel(backend Backend, recvCh chan *client.Packet, stopCh chan error) {
+func (s *ProxyServer) readBackendToChannel(backend *Backend, recvCh chan *client.Packet, stopCh chan error) {
 	agentID := backend.GetAgentID()
 	for {
 		in, err := backend.Recv()
@@ -836,7 +848,7 @@ func (s *ProxyServer) readBackendToChannel(backend Backend, recvCh chan *client.
 }
 
 // route the packet back to the correct client
-func (s *ProxyServer) serveRecvBackend(backend Backend, agentID string, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh <-chan *client.Packet) {
 	defer func() {
 		// Drain recvCh to ensure that readBackendToChannel is not blocked on a channel write.
 		// This should never happen, as termination of this function should only be initiated by closing recvCh.
@@ -985,14 +997,16 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, agentID string, recvCh <
 				klog.V(5).InfoS("CLOSE_RSP sent to frontend", "connectionID", resp.ConnectID)
 			}
 
+		case client.PacketType_DRAIN:
+			klog.V(2).InfoS("agent is draining", "agentID", agentID)
 		default:
 			klog.V(5).InfoS("Ignoring unrecognized packet from backend", "packet", pkt, "agentID", agentID)
 		}
 	}
-	klog.V(5).InfoS("Close backend of agent", "agentID", agentID)
+	klog.V(3).InfoS("Close backend of agent", "agentID", agentID)
 }
 
-func (s *ProxyServer) sendBackendClose(backend Backend, connectID int64, random int64, reason string) {
+func (s *ProxyServer) sendBackendClose(backend *Backend, connectID int64, random int64, reason string) {
 	agentID := backend.GetAgentID()
 	pkt := &client.Packet{
 		Type: client.PacketType_CLOSE_REQ,
@@ -1007,7 +1021,7 @@ func (s *ProxyServer) sendBackendClose(backend Backend, connectID int64, random 
 	}
 }
 
-func (s *ProxyServer) sendBackendDialClose(backend Backend, random int64, reason string) {
+func (s *ProxyServer) sendBackendDialClose(backend *Backend, random int64, reason string) {
 	agentID := backend.GetAgentID()
 	pkt := &client.Packet{
 		Type: client.PacketType_DIAL_CLS,

@@ -20,6 +20,7 @@ import (
 	"context"
 
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
@@ -32,20 +33,28 @@ var _ BackendManager = &DefaultRouteBackendManager{}
 func NewDefaultRouteBackendManager() *DefaultRouteBackendManager {
 	return &DefaultRouteBackendManager{
 		DefaultBackendStorage: NewDefaultBackendStorage(
-			[]header.IdentifierType{header.DefaultRoute})}
+			[]header.IdentifierType{header.DefaultRoute}, proxystrategies.ProxyStrategyDefaultRoute)}
 }
 
-// Backend tries to get a backend associating to the request destination host.
-func (dibm *DefaultRouteBackendManager) Backend(ctx context.Context) (Backend, error) {
-	dibm.mu.RLock()
-	defer dibm.mu.RUnlock()
-	if len(dibm.backends) == 0 {
-		return nil, &ErrNotFound{}
+// Backend tries to get a backend that advertises default route, with random selection.
+func (dibm *DefaultRouteBackendManager) Backend(_ context.Context) (*Backend, error) {
+	return dibm.GetRandomBackend()
+}
+
+func (dibm *DefaultRouteBackendManager) AddBackend(backend *Backend) {
+	agentID := backend.GetAgentID()
+	agentIdentifiers := backend.GetAgentIdentifiers()
+	if agentIdentifiers.DefaultRoute {
+		klog.V(5).InfoS("Add the agent to DefaultRouteBackendManager", "agentID", agentID)
+		dibm.addBackend(agentID, header.DefaultRoute, backend)
 	}
-	if len(dibm.defaultRouteAgentIDs) == 0 {
-		return nil, &ErrNotFound{}
+}
+
+func (dibm *DefaultRouteBackendManager) RemoveBackend(backend *Backend) {
+	agentID := backend.GetAgentID()
+	agentIdentifiers := backend.GetAgentIdentifiers()
+	if agentIdentifiers.DefaultRoute {
+		klog.V(5).InfoS("Remove the agent from the DefaultRouteBackendManager", "agentID", agentID)
+		dibm.removeBackend(agentID, header.DefaultRoute, backend)
 	}
-	agentID := dibm.defaultRouteAgentIDs[dibm.random.Intn(len(dibm.defaultRouteAgentIDs))]
-	klog.V(4).InfoS("Picked agent as backend", "agentID", agentID)
-	return dibm.backends[agentID][0], nil
 }

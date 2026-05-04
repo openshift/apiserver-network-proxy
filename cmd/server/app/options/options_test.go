@@ -52,7 +52,7 @@ func TestDefaultServerOptions(t *testing.T) {
 	assertDefaultValue(t, "FrontendKeepaliveTime", defaultServerOptions.FrontendKeepaliveTime, 1*time.Hour)
 	assertDefaultValue(t, "EnableProfiling", defaultServerOptions.EnableProfiling, false)
 	assertDefaultValue(t, "EnableContentionProfiling", defaultServerOptions.EnableContentionProfiling, false)
-	assertDefaultValue(t, "ServerCount", defaultServerOptions.ServerCount, uint(1))
+	assertDefaultValue(t, "ServerCount", defaultServerOptions.ServerCount, 1)
 	assertDefaultValue(t, "AgentNamespace", defaultServerOptions.AgentNamespace, "")
 	assertDefaultValue(t, "AgentServiceAccount", defaultServerOptions.AgentServiceAccount, "")
 	assertDefaultValue(t, "KubeconfigPath", defaultServerOptions.KubeconfigPath, "")
@@ -61,6 +61,9 @@ func TestDefaultServerOptions(t *testing.T) {
 	assertDefaultValue(t, "AuthenticationAudience", defaultServerOptions.AuthenticationAudience, "")
 	assertDefaultValue(t, "ProxyStrategies", defaultServerOptions.ProxyStrategies, "default")
 	assertDefaultValue(t, "CipherSuites", defaultServerOptions.CipherSuites, make([]string, 0))
+	assertDefaultValue(t, "XfrChannelSize", defaultServerOptions.XfrChannelSize, 10)
+	assertDefaultValue(t, "APIContentType", defaultServerOptions.APIContentType, "application/vnd.kubernetes.protobuf")
+
 }
 
 func assertDefaultValue(t *testing.T, fieldName string, actual, expected interface{}) {
@@ -144,6 +147,26 @@ func TestValidate(t *testing.T) {
 			field:    "CipherSuites",
 			value:    "TLS_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
 			expected: nil,
+		},
+		"Empty proxy strategies": {
+			field:    "ProxyStrategies",
+			value:    "",
+			expected: fmt.Errorf("ProxyStrategies cannot be empty"),
+		},
+		"Invalid proxy strategies": {
+			field:    "ProxyStrategies",
+			value:    "invalid",
+			expected: fmt.Errorf("invalid proxy strategies: unknown proxy strategy: invalid"),
+		},
+		"ZeroXfrChannelSize": {
+			field:    "XfrChannelSize",
+			value:    0,
+			expected: fmt.Errorf("channel size 0 must be greater than 0"),
+		},
+		"NegativeXfrChannelSize": {
+			field:    "XfrChannelSize",
+			value:    -10,
+			expected: fmt.Errorf("channel size -10 must be greater than 0"),
 		},
 	} {
 		t.Run(desc, func(t *testing.T) {

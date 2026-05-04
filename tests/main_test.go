@@ -18,6 +18,9 @@ package tests
 
 import (
 	"flag"
+	"fmt"
+	"log"
+	"os"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,8 +30,11 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/tests/framework"
 )
 
+var (
+	agentPath = flag.String("agent-path", "", "Path to the agent binary to test against, or empty to run the in-process agent.")
+)
+
 var Framework = framework.Framework{
-	AgentRunner:       &framework.InProcessAgentRunner{},
 	ProxyServerRunner: &framework.InProcessProxyServerRunner{},
 }
 
@@ -38,5 +44,39 @@ func TestMain(m *testing.M) {
 	fs.Set("v", "1") // Set klog verbosity.
 	metricsclient.Metrics.RegisterMetrics(prometheus.DefaultRegisterer)
 
+	flag.Parse()
+	if err := initFramework(); err != nil {
+		log.Fatalf("Failed to initialize framework: %v", err)
+	}
+
+	if err := framework.InitCertsDir(); err != nil {
+		log.Fatalf("Failed to write test certs: %v", err)
+	}
+	defer func() {
+		os.RemoveAll(framework.CertsDir)
+	}()
+
 	m.Run()
+}
+
+func initFramework() error {
+	if *agentPath == "" {
+		log.Print("Running tests with in-process agent")
+		Framework.AgentRunner = &framework.InProcessAgentRunner{}
+	} else {
+		info, err := os.Stat(*agentPath)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&0111 == 0 { // Path must be executable
+			return fmt.Errorf("%s is not an executable file", *agentPath)
+		}
+
+		log.Printf("Running tests with external agent %s", *agentPath)
+		Framework.AgentRunner = &framework.ExternalAgentRunner{
+			ExecutablePath: *agentPath,
+		}
+	}
+
+	return nil
 }

@@ -43,7 +43,6 @@ import (
 )
 
 const dialTimeout = 5 * time.Second
-const xfrChannelSize = 150
 
 // endpointConn tracks a connection from agent to node network.
 type endpointConn struct {
@@ -68,7 +67,7 @@ func (e *endpointConn) send(msg []byte) {
 			klog.InfoS("Recovered from attempt to write to closed channel")
 		}
 	}()
-	if e.warnChLim && len(e.dataCh) >= xfrChannelSize {
+	if e.warnChLim && len(e.dataCh) >= cap(e.dataCh) {
 		klog.V(2).InfoS("Data channel on agent is full", "connectionID", e.connID)
 	}
 
@@ -137,7 +136,11 @@ type Client struct {
 	address string
 	opts    []grpc.DialOption
 	conn    *grpc.ClientConn
-	stopCh  chan struct{}
+
+	drainCh   <-chan struct{}
+	drainOnce sync.Once
+	stopCh    chan struct{}
+
 	// locks
 	sendLock      sync.Mutex
 	recvLock      sync.Mutex
@@ -158,6 +161,7 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 		agentIdentifiers:        agentIdentifiers,
 		opts:                    opts,
 		probeInterval:           cs.probeInterval,
+		drainCh:                 cs.drainCh,
 		stopCh:                  make(chan struct{}),
 		serviceAccountTokenPath: cs.serviceAccountTokenPath,
 		connManager:             newConnectionManager(),
@@ -170,8 +174,8 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 	return a, serverCount, nil
 }
 
-// Connect makes the grpc dial to the proxy server. It returns the serverID
-// it connects to.
+// Connect makes the grpc dial to the proxy server. It returns the count
+// of the number of servers this agent should connected to.
 func (a *Client) Connect() (int, error) {
 	conn, err := grpc.Dial(a.address, a.opts...)
 	if err != nil {
@@ -325,6 +329,19 @@ func (a *Client) Serve() {
 		case <-a.stopCh:
 			klog.V(2).InfoS("stop agent client.")
 			return
+		case <-a.drainCh:
+			a.drainOnce.Do(func() {
+				klog.V(2).InfoS("drain agent client", "serverID", a.serverID, "agentID", a.agentID)
+				drainPkt := &client.Packet{
+					Type: client.PacketType_DRAIN,
+					Payload: &client.Packet_Drain{
+						Drain: &client.Drain{},
+					},
+				}
+				if err := a.Send(drainPkt); err != nil {
+					klog.ErrorS(err, "drain failure", "")
+				}
+			})
 		default:
 		}
 
@@ -337,7 +354,13 @@ func (a *Client) Serve() {
 			if status.Code(err) == codes.Canceled {
 				klog.V(2).InfoS("stream canceled", "serverID", a.serverID, "agentID", a.agentID)
 			} else {
-				klog.ErrorS(err, "could not read stream", "serverID", a.serverID, "agentID", a.agentID)
+				select {
+				case <-a.stopCh:
+					klog.V(5).InfoS("could not read stream because agent client is shutting down", "serverID", a.serverID, "agentID", a.agentID, "err", err)
+				default:
+					// If stopCh is not closed, this is a legitimate, unexpected error.
+					klog.ErrorS(err, "could not read stream", "serverID", a.serverID, "agentID", a.agentID)
+				}
 			}
 			return
 		}
@@ -359,7 +382,7 @@ func (a *Client) Serve() {
 			dialResp.GetDialResponse().Random = dialReq.Random
 
 			connID := atomic.AddInt64(&a.nextConnID, 1)
-			dataCh := make(chan []byte, xfrChannelSize)
+			dataCh := make(chan []byte, a.cs.xfrChannelSize)
 			dialDone := make(chan struct{})
 			eConn := &endpointConn{
 				dataCh:    dataCh,
@@ -390,7 +413,13 @@ func (a *Client) Serve() {
 					closePkt.GetCloseResponse().ConnectID = connID
 				}
 				if err := a.Send(closePkt); err != nil {
-					klog.ErrorS(err, "close response failure", "")
+					if err == io.EOF {
+						klog.V(4).InfoS("received EOF; connection already closed", "connectionID", connID, "dialID", dialReq.Random, "err", err)
+					} else if _, ok := a.connManager.Get(connID); !ok {
+						klog.V(5).InfoS("connection already closed", "connectionID", connID, "dialID", dialReq.Random, "err", err)
+					} else {
+						klog.ErrorS(err, "close response failure", "connectionID", connID, "dialID", dialReq.Random)
+					}
 				}
 				close(dataCh)
 				a.connManager.Delete(connID)
@@ -536,14 +565,14 @@ func (a *Client) remoteToProxy(connID int64, eConn *endpointConn) {
 				klog.ErrorS(err, "connection read failure", "connectionID", connID)
 			}
 			return
-		} else {
-			resp.Payload = &client.Packet_Data{Data: &client.Data{
-				Data:      buf[:n],
-				ConnectID: connID,
-			}}
-			if err := a.Send(resp); err != nil {
-				klog.ErrorS(err, "could not send DATA", "connectionID", connID)
-			}
+		}
+
+		resp.Payload = &client.Packet_Data{Data: &client.Data{
+			Data:      buf[:n],
+			ConnectID: connID,
+		}}
+		if err := a.Send(resp); err != nil {
+			klog.ErrorS(err, "could not send DATA", "connectionID", connID)
 		}
 	}
 }

@@ -42,24 +42,31 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
-
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/leases"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 )
 
 var udsListenerLock sync.Mutex
 
-const ReadHeaderTimeout = 60 * time.Second
+const (
+	ReadHeaderTimeout    = 60 * time.Second
+	LeaseDuration        = 30 * time.Second
+	LeaseRenewalInterval = 15 * time.Second
+	LeaseGCInterval      = 15 * time.Second
+)
 
 func NewProxyCommand(p *Proxy, o *options.ProxyRunOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:  "proxy",
 		Long: `A gRPC proxy server, receives requests from the API server and forwards to the agent.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return p.run(o)
+		RunE: func(_ *cobra.Command, _ []string) error {
+			stopCh := SetupSignalHandler()
+			return p.Run(o, stopCh)
 		},
 	}
 
@@ -81,11 +88,16 @@ func tlsCipherSuites(cipherNames []string) []uint16 {
 }
 
 type Proxy struct {
+	agentServer  *grpc.Server
+	adminServer  *http.Server
+	healthServer *http.Server
+
+	server *server.ProxyServer
 }
 
 type StopFunc func()
 
-func (p *Proxy) run(o *options.ProxyRunOptions) error {
+func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
 		return fmt.Errorf("failed to validate server options with %v", err)
@@ -94,7 +106,7 @@ func (p *Proxy) run(o *options.ProxyRunOptions) error {
 	defer cancel()
 
 	var k8sClient *kubernetes.Clientset
-	if o.AgentNamespace != "" {
+	if o.NeedsKubernetesClient {
 		config, err := clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
 		if err != nil {
 			return fmt.Errorf("failed to load kubernetes client config: %v", err)
@@ -108,6 +120,7 @@ func (p *Proxy) run(o *options.ProxyRunOptions) error {
 			klog.V(1).Infof("Setting k8s client Burst: %v", o.KubeconfigBurst)
 			config.Burst = o.KubeconfigBurst
 		}
+		config.ContentType = o.APIContentType
 		k8sClient, err = kubernetes.NewForConfig(config)
 		if err != nil {
 			return fmt.Errorf("failed to create kubernetes clientset: %v", err)
@@ -122,40 +135,64 @@ func (p *Proxy) run(o *options.ProxyRunOptions) error {
 		AuthenticationAudience: o.AuthenticationAudience,
 	}
 	klog.V(1).Infoln("Starting frontend server for client connections.")
-	ps, err := server.GenProxyStrategiesFromStr(o.ProxyStrategies)
+	ps, err := proxystrategies.ParseProxyStrategies(o.ProxyStrategies)
 	if err != nil {
 		return err
 	}
-	server := server.NewProxyServer(o.ServerID, ps, int(o.ServerCount), authOpt)
+	p.server = server.NewProxyServer(o.ServerID, ps, o.ServerCount, authOpt, o.XfrChannelSize)
 
-	frontendStop, err := p.runFrontendServer(ctx, o, server)
+	frontendStop, err := p.runFrontendServer(ctx, o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the frontend server: %v", err)
 	}
+	if frontendStop != nil {
+		defer frontendStop()
+	}
 
 	klog.V(1).Infoln("Starting agent server for tunnel connections.")
-	err = p.runAgentServer(o, server)
+	err = p.runAgentServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the agent server: %v", err)
 	}
+	defer p.agentServer.Stop()
+
+	labels, err := util.ParseLabels(o.LeaseLabel)
+	if err != nil {
+		return err
+	}
+
+	if o.EnableLeaseController {
+		leaseController := leases.NewController(
+			k8sClient,
+			o.ServerID,
+			int32(LeaseDuration.Seconds()),
+			LeaseRenewalInterval,
+			LeaseGCInterval,
+			fmt.Sprintf("konnectivity-proxy-server-%v", o.ServerID),
+			o.LeaseNamespace,
+			labels,
+		)
+		klog.V(1).Infoln("Starting lease acquisition and garbage collection controller.")
+		leaseController.Run(ctx)
+		defer leaseController.Stop()
+	}
+
 	klog.V(1).Infoln("Starting admin server for debug connections.")
-	err = p.runAdminServer(o, server)
+	err = p.runAdminServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the admin server: %v", err)
 	}
+	defer p.adminServer.Close()
+
 	klog.V(1).Infoln("Starting health server for healthchecks.")
-	err = p.runHealthServer(o, server)
+	err = p.runHealthServer(o, p.server)
 	if err != nil {
 		return fmt.Errorf("failed to run the health server: %v", err)
 	}
+	defer p.healthServer.Close()
 
-	stopCh := SetupSignalHandler()
 	<-stopCh
 	klog.V(1).Infoln("Shutting down server.")
-
-	if frontendStop != nil {
-		frontendStop()
-	}
 
 	return nil
 }
@@ -316,7 +353,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		}
 		labels := runpprof.Labels(
 			"core", "mtlsGrpcFrontend",
-			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
+			"port", strconv.Itoa(o.ServerPort),
 		)
 		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = grpcServer.GracefulStop
@@ -339,7 +376,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 		}
 		labels := runpprof.Labels(
 			"core", "mtlsHttpFrontend",
-			"port", strconv.FormatUint(uint64(o.ServerPort), 10),
+			"port", strconv.Itoa(o.ServerPort),
 		)
 		go runpprof.Do(context.Background(), labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
@@ -376,15 +413,17 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 	}
 	labels := runpprof.Labels(
 		"core", "agentListener",
-		"port", strconv.FormatUint(uint64(o.AgentPort), 10),
+		"port", strconv.Itoa(o.AgentPort),
 	)
 	go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+	p.agentServer = grpcServer
 
 	return nil
 }
 
-func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyServer) error {
+func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, _ *server.ProxyServer) error {
 	muxHandler := http.NewServeMux()
+	// /metrics moved to HealthServer but being maintained here for backward compatibility
 	muxHandler.Handle("/metrics", promhttp.Handler())
 	if o.EnableProfiling {
 		muxHandler.HandleFunc("/debug/pprof", util.RedirectTo("/debug/pprof/"))
@@ -396,7 +435,7 @@ func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyS
 			runtime.SetBlockProfileRate(1)
 		}
 	}
-	adminServer := &http.Server{
+	p.adminServer = &http.Server{
 		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminPort)),
 		Handler:           muxHandler,
 		MaxHeaderBytes:    1 << 20,
@@ -405,10 +444,10 @@ func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyS
 
 	labels := runpprof.Labels(
 		"core", "adminListener",
-		"port", strconv.FormatUint(uint64(o.AdminPort), 10),
+		"port", strconv.Itoa(o.AdminPort),
 	)
 	go runpprof.Do(context.Background(), labels, func(context.Context) {
-		err := adminServer.ListenAndServe()
+		err := p.adminServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "admin server could not listen")
 		}
@@ -419,10 +458,10 @@ func (p *Proxy) runAdminServer(o *options.ProxyRunOptions, server *server.ProxyS
 }
 
 func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.ProxyServer) error {
-	livenessHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	livenessHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "ok")
 	})
-	readinessHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	readinessHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		ready, msg := server.Readiness.Ready()
 		if ready {
 			w.WriteHeader(200)
@@ -430,15 +469,16 @@ func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.Proxy
 			return
 		}
 		w.WriteHeader(500)
-		fmt.Fprintf(w, msg)
+		fmt.Fprint(w, msg)
 	})
 
 	muxHandler := http.NewServeMux()
+	muxHandler.Handle("/metrics", promhttp.Handler())
 	muxHandler.HandleFunc("/healthz", livenessHandler)
 	// "/ready" is deprecated but being maintained for backward compatibility
 	muxHandler.HandleFunc("/ready", readinessHandler)
 	muxHandler.HandleFunc("/readyz", readinessHandler)
-	healthServer := &http.Server{
+	p.healthServer = &http.Server{
 		Addr:              net.JoinHostPort(o.HealthBindAddress, strconv.Itoa(o.HealthPort)),
 		Handler:           muxHandler,
 		MaxHeaderBytes:    1 << 20,
@@ -447,10 +487,10 @@ func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.Proxy
 
 	labels := runpprof.Labels(
 		"core", "healthListener",
-		"port", strconv.FormatUint(uint64(o.HealthPort), 10),
+		"port", strconv.Itoa(o.HealthPort),
 	)
 	go runpprof.Do(context.Background(), labels, func(context.Context) {
-		err := healthServer.ListenAndServe()
+		err := p.healthServer.ListenAndServe()
 		if err != nil {
 			klog.ErrorS(err, "health server could not listen")
 		}
@@ -458,4 +498,9 @@ func (p *Proxy) runHealthServer(o *options.ProxyRunOptions, server *server.Proxy
 	})
 
 	return nil
+}
+
+// ProxyServer exposes internal state for testing.
+func (p *Proxy) ProxyServer() *server.ProxyServer {
+	return p.server
 }

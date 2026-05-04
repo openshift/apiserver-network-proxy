@@ -167,13 +167,13 @@ func (o *GrpcProxyClientOptions) Validate() error {
 	}
 	if o.proxyUdsName != "" {
 		if o.proxyHost != "" {
-			return fmt.Errorf("please do set proxy host when using UDS")
+			return fmt.Errorf("please set proxy host to \"\" when using UDS")
 		}
 		if o.proxyPort != 0 {
-			return fmt.Errorf("please do set proxy server port to 0 not %d when using UDS", o.proxyPort)
+			return fmt.Errorf("please set proxy server port to 0 when using UDS")
 		}
 		if o.clientKey != "" || o.clientCert != "" || o.caCert != "" {
-			return fmt.Errorf("please do set cert materials when using UDS, key = %s, cert = %s, CA = %s",
+			return fmt.Errorf("please do not set cert materials when using UDS, key = %s, cert = %s, CA = %s",
 				o.clientKey, o.clientCert, o.caCert)
 		}
 	}
@@ -216,7 +216,7 @@ func newGrpcProxyClientCommand(c *Client, o *GrpcProxyClientOptions) *cobra.Comm
 	cmd := &cobra.Command{
 		Use:  "proxy-client",
 		Long: `A gRPC proxy Client, primarily used to test the Kubernetes gRPC Proxy Server.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
 			return c.run(o)
 		},
@@ -231,7 +231,7 @@ type Client struct {
 func (c *Client) run(o *GrpcProxyClientOptions) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
-		return fmt.Errorf("failed to validate proxy client options, got %v", err)
+		return fmt.Errorf("failed to validate proxy client options, got: %w", err)
 	}
 
 	// Run remote simple http service on server side as
@@ -479,7 +479,7 @@ func (c *Client) getUDSDialer(o *GrpcProxyClientOptions) (func(ctx context.Conte
 		return nil, fmt.Errorf("failed to process mode %s", o.mode)
 	}
 
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(_ context.Context, _, _ string) (net.Conn, error) {
 		return proxyConn, nil
 	}, nil
 }
@@ -556,7 +556,7 @@ func (c *Client) getMTLSDialer(o *GrpcProxyClientOptions) (func(ctx context.Cont
 		return nil, fmt.Errorf("failed to process mode %s", o.mode)
 	}
 
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(_ context.Context, _, _ string) (net.Conn, error) {
 		return proxyConn, nil
 	}, nil
 }

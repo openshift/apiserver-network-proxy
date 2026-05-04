@@ -55,10 +55,15 @@ For local builds these can be set to anything.
 For image builds these determine the location of your image.
 For GCE the registry should be gcr.io and PROJECT_ID should be the project you
 want to use the images in.
+Please ensure the go bin directory (usually `~/go/bin`) is in your `PATH`.
 
 ### Mockgen
 
-The [```mockgen```](https://github.com/golang/mock) tool must be installed on your system.
+The [```mockgen```](https://github.com/uber-go/mock) tool must be installed on your system.
+
+Currently, we are using go.uber.org/mock/mockgen@v0.5.2
+
+`go install go.uber.org/mock/mockgen@v0.5.2`
 
 ### Protoc
 
@@ -66,11 +71,11 @@ Proto definitions are compiled with `protoc`. Please ensure you have protoc inst
 
 Currently, we are using protoc-gen-go@v1.27.1
 
-`go get google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1`
+`go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1`
 
 Currently, we are using protoc-gen-go-grpc@v1.2
 
-`go get google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2`
+`go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2`
 
 ### Local builds
 
@@ -189,6 +194,18 @@ curl -v -p --proxy-key certs/frontend/private/proxy-client.key --proxy-cert cert
 
 ### Running on kubernetes
 See following [README.md](examples/kubernetes/README.md)
+
+### Running on a local kubernetes cluster with `kind`
+See this [README.md](examples/kind/README.md) for an example that creates a local kubernetes cluster using` kind` and
+deploys the proxy agent on a worker node and the proxy server on a control plane node.
+
+See this [README.md](examples/kind-multinode/README.md) for a similar example that creates a `kind` cluster with a 
+user-configurable number of control plane and worker nodes and optionally sideloads custom proxy agent and server images.
+
+### Tutorials
+
+See this [Set up Konnectivity service](https://kubernetes.io/docs/tasks/extend-kubernetes/setup-konnectivity/) tutorial for
+an example of the Konnectivity service providing a TCP level proxy for the control plane to cluster communication.
 
 ### Clients
 

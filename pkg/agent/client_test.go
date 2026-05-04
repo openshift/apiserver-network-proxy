@@ -54,7 +54,7 @@ func TestServeData_HTTP(t *testing.T) {
 
 	// Start test http server as remote service
 	expectedBody := "Hello, client"
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, expectedBody)
 	}))
 	defer ts.Close()
@@ -152,7 +152,7 @@ func TestClose_Client(t *testing.T) {
 	defer close(stopCh)
 
 	// Start test http server as remote service
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "hello, world")
 	}))
 	defer ts.Close()
@@ -341,6 +341,40 @@ func TestFailedSend_DialResp_GRPC(t *testing.T) {
 			t.Errorf("Leaked %d connections", conns)
 		}
 	}()
+}
+
+func TestDrain(t *testing.T) {
+	var stream agent.AgentService_ConnectClient
+	drainCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	cs := &ClientSet{
+		clients: make(map[string]*Client),
+		drainCh: drainCh,
+		stopCh:  stopCh,
+	}
+	testClient := &Client{
+		connManager: newConnectionManager(),
+		drainCh:     drainCh,
+		stopCh:      stopCh,
+		cs:          cs,
+	}
+	testClient.stream, stream = pipe()
+
+	// Start agent
+	go testClient.Serve()
+	defer close(stopCh)
+
+	// Simulate pod first shutdown signal
+	close(drainCh)
+
+	// Expect to receive DRAIN packet from (Agent) Client
+	pkt, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkt.Type != client.PacketType_DRAIN {
+		t.Errorf("expect PacketType_DRAIN; got %v", pkt.Type)
+	}
 }
 
 // fakeStream implements AgentService_ConnectClient

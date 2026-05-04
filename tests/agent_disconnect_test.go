@@ -29,8 +29,6 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
 	"sigs.k8s.io/apiserver-network-proxy/tests/framework"
 )
 
@@ -92,7 +90,7 @@ func TestProxy_Agent_Disconnect_Persistent_Connection(t *testing.T) {
 	}
 }
 
-func TestProxy_Agent_Reconnect(t *testing.T) {
+func TestAgentRestartReconnect(t *testing.T) {
 	testcases := []struct {
 		name                string
 		proxyServerFunction func(testing.TB) framework.ProxyServer
@@ -175,8 +173,8 @@ func clientRequest(c *http.Client, addr string) ([]byte, error) {
 	return data, nil
 }
 
-func createGrpcTunnelClient(ctx context.Context, proxyAddr, addr string) (*http.Client, error) {
-	tunnel, err := client.CreateSingleUseGrpcTunnel(ctx, proxyAddr, grpc.WithInsecure())
+func createGrpcTunnelClient(ctx context.Context, proxyAddr, _ string) (*http.Client, error) {
+	tunnel, err := createSingleUseGrpcTunnel(ctx, proxyAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +189,8 @@ func createGrpcTunnelClient(ctx context.Context, proxyAddr, addr string) (*http.
 	return c, nil
 }
 
-func createHTTPConnectClient(ctx context.Context, proxyAddr, addr string) (*http.Client, error) {
-	conn, err := net.Dial("tcp", proxyAddr)
+func createHTTPConnectClient(_ context.Context, proxyAddr, addr string) (*http.Client, error) {
+	conn, err := net.Dial("unix", proxyAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +216,7 @@ func createHTTPConnectClient(ctx context.Context, proxyAddr, addr string) (*http
 		return nil, fmt.Errorf("unexpected extra buffer")
 	}
 
-	dialer := func(network, addr string) (net.Conn, error) {
+	dialer := func(_, _ string) (net.Conn, error) {
 		return conn, nil
 	}
 

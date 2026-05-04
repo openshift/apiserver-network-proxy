@@ -89,7 +89,7 @@ func newTestServerCommand(p *TestServer, o *TestServerRunOptions) *cobra.Command
 	cmd := &cobra.Command{
 		Use:  "test http server",
 		Long: `A test http server, url determines behavior for certain tests.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			return p.run(o)
 		},
 	}
@@ -143,15 +143,15 @@ func SetupSignalHandler() (stopCh <-chan struct{}) {
 	return stop
 }
 
-func returnSuccess(w http.ResponseWriter, req *http.Request) {
+func returnSuccess(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n    <head>\n        <title>Success</title>\n    </head>\n    <body>\n        <p>The success test page!</p>\n    </body>\n</html>")
 }
 
-func returnError(w http.ResponseWriter, req *http.Request) {
+func returnError(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 }
 
-func closeNoResponse(w http.ResponseWriter, req *http.Request) {
+func closeNoResponse(w http.ResponseWriter, _ *http.Request) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
