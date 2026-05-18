@@ -1,16 +1,23 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 reviewers:
-  - elmiko
-  - tallclair
-  - ipochi
+  - bryan-cox
+  - clebs
+  - csrwng
+  - devguyio
+  - enxebre
+  - jparrill
+  - muraee
+  - Nirshal
+  - relyt0925
+  - sdminonne
+  - sjenning
 approvers:
-  - anfernee
-  - cheftako
-  - jkh52
-  - ipochi
-emeritus_approvers:
-  - andrewsykim
-  - caesarxuchao
-  - mcrute
-  - Sh4d1
+  - bryan-cox
+  - csrwng
+  - devguyio
+  - enxebre
+  - jparrill
+  - muraee
+  - sjenning
+component: hypershift
