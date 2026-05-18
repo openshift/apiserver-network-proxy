@@ -184,6 +184,7 @@ func (c *ProxyClientConnection) send(pkt *client.Packet) error {
 					},
 					Proto:      "HTTP/1.1",
 					ProtoMinor: 1,
+					ProtoMajor: 1,
 				}
 
 				t.Write(c.HTTP)
@@ -554,7 +555,7 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 	defer func() {
 		klog.V(5).InfoS("Close frontend streaming", "connectionID", firstConnID, "streamUID", frontend.streamUID)
 		if backend == nil {
-			klog.V(2).InfoS("Streaming closed before backend intialized")
+			klog.V(2).InfoS("Streaming closed before backend initialized")
 		}
 
 		// As the read side of the recvCh channel, we cannot close it.
@@ -999,6 +1000,8 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 
 		case client.PacketType_DRAIN:
 			klog.V(2).InfoS("agent is draining", "agentID", agentID)
+			backend.SetDraining()
+			klog.V(2).InfoS("marked backend as draining, will not route new requests to this agent", "agentID", agentID)
 		default:
 			klog.V(5).InfoS("Ignoring unrecognized packet from backend", "packet", pkt, "agentID", agentID)
 		}
