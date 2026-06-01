@@ -18,6 +18,7 @@ package options
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -61,6 +62,7 @@ func TestDefaultServerOptions(t *testing.T) {
 	assertDefaultValue(t, "AuthenticationAudience", defaultServerOptions.AuthenticationAudience, "")
 	assertDefaultValue(t, "ProxyStrategies", defaultServerOptions.ProxyStrategies, "default")
 	assertDefaultValue(t, "CipherSuites", defaultServerOptions.CipherSuites, make([]string, 0))
+	assertDefaultValue(t, "TLSMinVersion", defaultServerOptions.TLSMinVersion, "")
 	assertDefaultValue(t, "XfrChannelSize", defaultServerOptions.XfrChannelSize, 10)
 	assertDefaultValue(t, "APIContentType", defaultServerOptions.APIContentType, "application/vnd.kubernetes.protobuf")
 	assertDefaultValue(t, "GracefulShutdownTimeout", defaultServerOptions.GracefulShutdownTimeout, 0*time.Second)
@@ -74,11 +76,30 @@ func assertDefaultValue(t *testing.T, fieldName string, actual, expected interfa
 }
 
 func TestValidate(t *testing.T) {
+	tempFile, err := os.CreateTemp("", "server-ca-cert")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	tempFile.Close()
+
+	_, nonExistentErr := os.Stat("non-existent-file.crt")
+
 	for desc, tc := range map[string]struct {
 		field    string
 		value    interface{}
 		expected error
 	}{
+		"ServerCaCert empty in TCP mode": {
+			field:    "ServerCaCert",
+			value:    "",
+			expected: fmt.Errorf("server ca cert must be set when in TCP mode (uds-name is empty)"),
+		},
+		"ServerCaCert non-existent in TCP mode": {
+			field:    "ServerCaCert",
+			value:    "non-existent-file.crt",
+			expected: fmt.Errorf("error checking server CA cert non-existent-file.crt, got %v", nonExistentErr),
+		},
 		"default": {
 			field:    "",
 			value:    nil,
@@ -149,6 +170,21 @@ func TestValidate(t *testing.T) {
 			value:    "TLS_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
 			expected: nil,
 		},
+		"ValidTLSMinVersion12": {
+			field:    "TLSMinVersion",
+			value:    "VersionTLS12",
+			expected: nil,
+		},
+		"ValidTLSMinVersion13": {
+			field:    "TLSMinVersion",
+			value:    "VersionTLS13",
+			expected: nil,
+		},
+		"InvalidTLSMinVersion": {
+			field:    "TLSMinVersion",
+			value:    "InvalidVersion",
+			expected: fmt.Errorf("unsupported TLS version \"InvalidVersion\", supported values are: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13"),
+		},
 		"Empty proxy strategies": {
 			field:    "ProxyStrategies",
 			value:    "",
@@ -187,6 +223,9 @@ func TestValidate(t *testing.T) {
 	} {
 		t.Run(desc, func(t *testing.T) {
 			testServerOptions := NewProxyRunOptions()
+			if tc.field != "ServerCaCert" {
+				testServerOptions.ServerCaCert = tempFile.Name()
+			}
 			if tc.field == "CipherSuites" {
 				testServerOptions.Flags().Set("cipher-suites", tc.value.(string))
 			} else if tc.field != "" {
