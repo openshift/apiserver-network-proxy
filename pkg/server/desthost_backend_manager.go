@@ -80,9 +80,18 @@ func (dibm *DestHostBackendManager) Backend(ctx context.Context) (*Backend, erro
 		bes, exist := dibm.backends[destHost]
 		if exist && len(bes) > 0 {
 			klog.V(5).InfoS("Get the backend through the DestHostBackendManager", "destHost", destHost)
-			//TODO: change dibm.random.Intn(len(bes)) to be in sync with community when they fix
-			// https://github.com/kubernetes-sigs/apiserver-network-proxy/issues/261
-			return dibm.backends[destHost][dibm.random.Intn(len(bes))], nil
+
+			var nonDraining []*Backend
+			for _, be := range bes {
+				if !be.IsDraining() {
+					nonDraining = append(nonDraining, be)
+				}
+			}
+			if len(nonDraining) > 0 {
+				return nonDraining[dibm.random.Intn(len(nonDraining))], nil
+			}
+			klog.V(3).InfoS("All backends for destination host are draining, using one as fallback", "destHost", destHost)
+			return bes[dibm.random.Intn(len(bes))], nil
 		}
 	}
 	return nil, &ErrNotFound{}
