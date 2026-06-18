@@ -17,6 +17,7 @@ limitations under the License.
 package options
 
 import (
+	"crypto/tls"
 	"fmt"
 	"os"
 	"time"
@@ -104,7 +105,11 @@ type ProxyRunOptions struct {
 	// also checks if given comma separated list contains cipher from tls.InsecureCipherSuites().
 	// NOTE that cipher suites are not configurable for TLS1.3,
 	// see: https://pkg.go.dev/crypto/tls#Config, so in that case, this option won't have any effect.
-	CipherSuites   []string
+	CipherSuites []string
+	// Minimum TLS version for server connections.
+	// Accepted values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13.
+	// If empty, defaults to VersionTLS12.
+	TLSMinVersion  string
 	XfrChannelSize int
 
 	// Lease controller configuration
@@ -117,6 +122,8 @@ type ProxyRunOptions struct {
 	NeedsKubernetesClient bool
 	// Graceful shutdown timeout duration
 	GracefulShutdownTimeout time.Duration
+	// Backend dial timeout duration for requests from the server to backend agents.
+	BackendDialTimeout time.Duration
 }
 
 func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
@@ -153,11 +160,13 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.AuthenticationAudience, "authentication-audience", o.AuthenticationAudience, "Expected agent's token authentication audience (used with agent-namespace, agent-service-account, kubeconfig).")
 	flags.StringVar(&o.ProxyStrategies, "proxy-strategies", o.ProxyStrategies, "The list of proxy strategies used by the server to pick an agent/tunnel, available strategies are: default, destHost, defaultRoute.")
 	flags.StringSliceVar(&o.CipherSuites, "cipher-suites", o.CipherSuites, "The comma separated list of allowed cipher suites. Has no effect on TLS1.3. Empty means allow default list.")
+	flags.StringVar(&o.TLSMinVersion, "tls-min-version", o.TLSMinVersion, "Minimum TLS version for server connections. Accepted values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13. Empty defaults to VersionTLS12.")
 	flags.IntVar(&o.XfrChannelSize, "xfr-channel-size", o.XfrChannelSize, "The size of the two KNP server channels used in server for transferring data. One channel is for data coming from the Kubernetes API Server, and the other one is for data coming from the KNP agent.")
 	flags.BoolVar(&o.EnableLeaseController, "enable-lease-controller", o.EnableLeaseController, "Enable lease controller to publish and garbage collect proxy server leases.")
 	flags.StringVar(&o.LeaseNamespace, "lease-namespace", o.LeaseNamespace, "The namespace where lease objects are managed by the controller.")
 	flags.StringVar(&o.LeaseLabel, "lease-label", o.LeaseLabel, "The labels on which the lease objects are managed.")
 	flags.DurationVar(&o.GracefulShutdownTimeout, "graceful-shutdown-timeout", o.GracefulShutdownTimeout, "Timeout duration for graceful shutdown of the server. The server will wait for active connections to close before forcefully terminating. Set to 0 to disable graceful shutdown (default: 0).")
+	flags.DurationVar(&o.BackendDialTimeout, "backend-dial-timeout", o.BackendDialTimeout, "Timeout duration for sending DIAL_REQ packets to backend agent streams and waiting for DIAL_RSP. Set to 0 to disable timeout (default: 0).")
 	flags.Bool("warn-on-channel-limit", true, "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 	flags.MarkDeprecated("warn-on-channel-limit", "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 
@@ -200,8 +209,10 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("LeaseNamespace set to %s.\n", o.LeaseNamespace)
 	klog.V(1).Infof("LeaseLabel set to %s.\n", o.LeaseLabel)
 	klog.V(1).Infof("CipherSuites set to %q.\n", o.CipherSuites)
+	klog.V(1).Infof("TLSMinVersion set to %q.\n", o.TLSMinVersion)
 	klog.V(1).Infof("XfrChannelSize set to %d.\n", o.XfrChannelSize)
 	klog.V(1).Infof("GracefulShutdownTimeout set to %v.\n", o.GracefulShutdownTimeout)
+	klog.V(1).Infof("BackendDialTimeout set to %v.\n", o.BackendDialTimeout)
 }
 
 func (o *ProxyRunOptions) Validate() error {
@@ -262,6 +273,10 @@ func (o *ProxyRunOptions) Validate() error {
 		}
 		if o.ServerCaCert != "" {
 			return fmt.Errorf("server ca cert should not be set for UDS")
+		}
+	} else {
+		if o.ServerCaCert == "" {
+			return fmt.Errorf("server ca cert must be set when in TCP mode (uds-name is empty)")
 		}
 	}
 	if o.ServerPort > 49151 {
@@ -325,6 +340,16 @@ func (o *ProxyRunOptions) Validate() error {
 	if o.XfrChannelSize <= 0 {
 		return fmt.Errorf("channel size %d must be greater than 0", o.XfrChannelSize)
 	}
+	// validate the TLS min version
+	if o.TLSMinVersion != "" {
+		tlsVer, err := util.GetTLSVersion(o.TLSMinVersion)
+		if err != nil {
+			return err
+		}
+		if tlsVer < tls.VersionTLS12 {
+			klog.Warningf("--tls-min-version=%s is below TLS 1.2 and is considered insecure (RFC 8996)", o.TLSMinVersion)
+		}
+	}
 	// validate the cipher suites
 	if len(o.CipherSuites) != 0 {
 		acceptedCiphers := util.GetAcceptedCiphers()
@@ -346,6 +371,9 @@ func (o *ProxyRunOptions) Validate() error {
 	// Validate graceful shutdown timeout
 	if o.GracefulShutdownTimeout < 0 {
 		return fmt.Errorf("graceful-shutdown-timeout must be >= 0, got %v", o.GracefulShutdownTimeout)
+	}
+	if o.BackendDialTimeout < 0 {
+		return fmt.Errorf("backend-dial-timeout must be >= 0, got %v", o.BackendDialTimeout)
 	}
 
 	o.NeedsKubernetesClient = usingServiceAccountAuth || o.EnableLeaseController
@@ -387,11 +415,13 @@ func NewProxyRunOptions() *ProxyRunOptions {
 		AuthenticationAudience:    "",
 		ProxyStrategies:           "default",
 		CipherSuites:              make([]string, 0),
+		TLSMinVersion:             "",
 		XfrChannelSize:            10,
 		EnableLeaseController:     false,
 		LeaseNamespace:            "kube-system",
 		LeaseLabel:                "k8s-app=konnectivity-server",
 		GracefulShutdownTimeout:   0,
+		BackendDialTimeout:        0,
 	}
 	return &o
 }
