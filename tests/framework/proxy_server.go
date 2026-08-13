@@ -73,9 +73,11 @@ func (*InProcessProxyServerRunner) Start(t testing.TB, opts ProxyServerOpts) (Pr
 	}()
 
 	healthAddr := net.JoinHostPort(o.HealthBindAddress, strconv.Itoa(o.HealthPort))
-	if err := wait.PollImmediateWithContext(ctx, 100*time.Millisecond, ForeverTestTimeout, func(context.Context) (bool, error) {
-		return checkLiveness(healthAddr), nil
-	}); err != nil {
+	if err := wait.PollImmediateWithContext(ctx, 100*time.Millisecond, ForeverTestTimeout,
+		func(context.Context) (bool, error) {
+			return checkLiveness(healthAddr), nil
+		},
+	); err != nil {
 		close(stopCh)
 		return nil, fmt.Errorf("server never came up: %v", err)
 	}
@@ -88,7 +90,7 @@ func (*InProcessProxyServerRunner) Start(t testing.TB, opts ProxyServerOpts) (Pr
 		agentAddr:   net.JoinHostPort(o.AgentBindAddress, strconv.Itoa(o.AgentPort)),
 		frontAddr:   o.UdsName,
 	}
-	t.Cleanup(ps.Stop)
+	defer t.Cleanup(ps.Stop)
 	return ps, nil
 }
 

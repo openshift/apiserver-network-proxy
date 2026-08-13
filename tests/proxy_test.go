@@ -39,6 +39,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
 	metricsclient "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client/metrics"
 	clientmetricstest "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics/testing"
@@ -78,7 +79,14 @@ func newSizedServer(length, chunks int) *testServer {
 
 func (s *testServer) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	for i := 0; i < s.chunks; i++ {
-		w.Write(s.echo)
+		n, err := w.Write(s.echo)
+		if err != nil {
+			klog.Error(err, "Test server failed to write")
+		}
+		if n < len(s.echo) {
+			klog.V(1).InfoS("testServer:ServeHTTP write",
+				"length", n, "expected", len(s.echo))
+		}
 	}
 }
 
@@ -562,7 +570,7 @@ func TestProxy_LargeResponse(t *testing.T) {
 	expectCleanShutdown(t)
 
 	ctx := context.Background()
-	length := 1 << 20 // 1M
+	length := 1 << 21 // 2M
 	chunks := 10
 	server := httptest.NewServer(newSizedServer(length, chunks))
 	defer server.Close()
@@ -598,7 +606,7 @@ func TestProxy_LargeResponse(t *testing.T) {
 	}
 
 	data, err := io.ReadAll(r.Body)
-	r.Body.Close()
+	defer r.Body.Close()
 	if err != nil {
 		t.Error(err)
 	}
