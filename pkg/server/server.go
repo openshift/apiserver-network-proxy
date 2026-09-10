@@ -95,17 +95,18 @@ const defaultBackendDialTimeout = 0
 var errBackendDialTimeout = errors.New("timed out waiting for backend dial")
 
 type ProxyClientConnection struct {
-	Mode        string
-	HTTP        io.ReadWriter
-	frontend    *GrpcFrontend
-	CloseHTTP   func() error
-	connected   chan struct{}
-	dialID      int64
-	connectID   int64
-	agentID     string
-	start       time.Time
-	backend     *Backend
-	dialAddress string // cached for logging
+	Mode          string
+	HTTP          io.ReadWriter
+	frontend      *GrpcFrontend
+	CloseHTTP     func() error
+	connected     chan struct{}
+	dialID        int64
+	connectID     int64
+	agentID       string
+	start         time.Time
+	establishedAt time.Time
+	backend       *Backend
+	dialAddress   string // cached for logging
 }
 
 const (
@@ -389,6 +390,17 @@ func (s *ProxyServer) addBackend(backend *Backend) {
 	}
 }
 
+func (s *ProxyServer) markBackendDraining(backend *Backend) {
+	// Publish the state before notifying managers so concurrent selection can
+	// reject or repair a stale non-draining index entry.
+	backend.SetDraining()
+	for _, bm := range s.BackendManagers {
+		if marker, ok := bm.(backendDrainingMarker); ok {
+			marker.markBackendDraining(backend)
+		}
+	}
+}
+
 func (s *ProxyServer) removeBackend(backend *Backend) {
 	for _, bm := range s.BackendManagers {
 		bm.RemoveBackend(backend)
@@ -407,6 +419,7 @@ func (s *ProxyServer) addEstablished(agentID string, connID int64, p *ProxyClien
 	if _, ok := s.established[agentID]; !ok {
 		s.established[agentID] = make(map[int64]*ProxyClientConnection)
 	}
+	p.establishedAt = time.Now()
 	s.established[agentID][connID] = p
 
 	metrics.Metrics.SetEstablishedConnCount(s.getCount(s.established))
@@ -428,6 +441,7 @@ func (s *ProxyServer) removeEstablished(agentID string, connID int64) *ProxyClie
 		delete(s.established, agentID)
 	}
 	metrics.Metrics.SetEstablishedConnCount(s.getCount(s.established))
+	metrics.Metrics.ObserveConnectionDuration(time.Since(ret.establishedAt))
 	return ret
 }
 
@@ -460,6 +474,7 @@ func (s *ProxyServer) removeEstablishedForBackendConn(agentID string, backend *B
 		if frontend.backend == backend {
 			delete(established, connID)
 			ret = append(ret, frontend)
+			metrics.Metrics.ObserveConnectionDuration(time.Since(frontend.establishedAt))
 		}
 	}
 	if len(established) == 0 {
@@ -900,10 +915,11 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 	}
 
 	klog.V(2).InfoS("Agent connected", "agentID", agentID, "serverID", s.serverID)
+	recvCh := make(chan *client.Packet, s.xfrChannelSize)
+	backend.recvCh = recvCh
+
 	s.addBackend(backend)
 	defer s.removeBackend(backend)
-
-	recvCh := make(chan *client.Packet, s.xfrChannelSize)
 
 	go runpprof.Do(context.Background(), labels, func(context.Context) { s.serveRecvBackend(backend, agentID, recvCh) })
 
@@ -1105,7 +1121,7 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 
 		case client.PacketType_DRAIN:
 			klog.V(2).InfoS("agent is draining", "agentID", agentID)
-			backend.SetDraining()
+			s.markBackendDraining(backend)
 			klog.V(2).InfoS("marked backend as draining, will not route new requests to this agent", "agentID", agentID)
 		default:
 			klog.V(5).InfoS("Ignoring unrecognized packet from backend", "packet", pkt, "agentID", agentID)

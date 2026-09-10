@@ -19,14 +19,12 @@ package app
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	netpprof "net/http/pprof"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	runpprof "runtime/pprof"
 	"strconv"
@@ -41,6 +39,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
@@ -366,7 +365,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsGrpcFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -386,7 +385,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsHttpFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			udsListener, err := getUDSListener(ctx, o.UdsName)
 			if err != nil {
 				klog.ErrorS(err, "failed to get uds listener")
@@ -422,14 +421,9 @@ func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []st
 		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: minVersion, CipherSuites: cipherSuiteIDs}, nil // #nosec G402
 	}
 
-	certPool := x509.NewCertPool()
-	caCert, err := os.ReadFile(filepath.Clean(caFile))
+	certPool, err := certutil.NewPool(caFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read cluster CA cert %s: %v", caFile, err)
-	}
-	ok := certPool.AppendCertsFromPEM(caCert)
-	if !ok {
-		return nil, fmt.Errorf("failed to append cluster CA cert to the cert pool")
+		return nil, fmt.Errorf("failed to load CA cert: %w", err)
 	}
 
 	tlsConfig := &tls.Config{ // #nosec G402
@@ -443,7 +437,7 @@ func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []st
 	return tlsConfig, nil
 }
 
-func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
+func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
 	var stop StopFunc
 
 	var tlsConfig *tls.Config
@@ -469,7 +463,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsGrpcFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -492,7 +486,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsHttpFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
