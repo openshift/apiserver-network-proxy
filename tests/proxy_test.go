@@ -606,7 +606,11 @@ func TestProxy_LargeResponse(t *testing.T) {
 	}
 
 	data, err := io.ReadAll(r.Body)
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			t.Errorf("close response body: %v", err)
+		}
+	}()
 	if err != nil {
 		t.Error(err)
 	}
