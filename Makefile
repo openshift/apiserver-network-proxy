@@ -35,8 +35,28 @@ endif
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 CFSSL_VERSION ?= 1.6.5
-CFSSL_URL ?= https://github.com/cloudflare/cfssl/releases/download/v$(CFSSL_VERSION)/cfssl_$(CFSSL_VERSION)_$(GOOS)_$(GOARCH); \
+CFSSL_URL ?= https://github.com/cloudflare/cfssl/releases/download/v$(CFSSL_VERSION)/cfssl_$(CFSSL_VERSION)_$(GOOS)_$(GOARCH)
 CFSSLJSON_URL ?= https://github.com/cloudflare/cfssl/releases/download/v$(CFSSL_VERSION)/cfssljson_$(CFSSL_VERSION)_$(GOOS)_$(GOARCH)
+# SHA-256 digests from the CFSSL v1.6.5 release checksums.
+CFSSL_SHA256_darwin_amd64 := 6625b252053d9499bf26102b8fa78d7f675de56703d0808f8ff6dcf43121fa0c
+CFSSL_SHA256_darwin_arm64 := 9a38b997ac23bc2eed89d6ad79ea5ae27c29710f66fdabdff2aa16eaaadc30d4
+CFSSL_SHA256_linux_amd64 := ff4d3a1387ea3e1ee74f4bb8e5ffe9cbab5bee43c710333c206d14199543ebdf
+CFSSL_SHA256_linux_arm64 := bc1a0b3a33ab415f3532af1d52cad7c9feec0156df2069f1cbbb64255485f108
+CFSSL_SHA256_linux_armv6 := ef96f4721bfa917a67b77cd3c0a112862db27f3242b75d6e985fed585ea6e6f4
+CFSSL_SHA256_linux_s390x := a458ae4a210df0d59eb4b1650dffed5d8f9580871bfef4116cb218ce5b339de1
+CFSSL_SHA256_windows_amd64 := 0b9976147d8e75d907fd0eda136888127874f05e9e18cc20046a8e413122f3e4
+CFSSLJSON_SHA256_darwin_amd64 := 1529a7a163801be8cf7d7a347b0346cc56cc8f351dbc0131373b6fb76bb4ab64
+CFSSLJSON_SHA256_linux_amd64 := 09fbcb7a3b3d6394936ea61eabff1e8a59a8ac3b528deeb14cf66cdbbe9a534f
+CFSSLJSON_SHA256_linux_arm64 := a389793bc2376116fe2fff996b4a2f772a59a4f65048a5cfb4789b2c0ea4a7c9
+CFSSLJSON_SHA256_linux_armv6 := 283cf16acf900ec42737bed84fbc6701a523753b646e605d09985311b5c70db3
+CFSSLJSON_SHA256_linux_s390x := ef293ac5f2dfc1d32c345bdb0b0407d85b1eb506ba53914a788296e1525eb40e
+CFSSLJSON_SHA256_windows_amd64 := 3ed76d102bf3121a22fb28cb537dad3d0763f9e7a713e134d043cc18923a2dc8
+CFSSL_SHA256 ?= $(CFSSL_SHA256_$(GOOS)_$(GOARCH))
+CFSSLJSON_SHA256 ?= $(CFSSLJSON_SHA256_$(GOOS)_$(GOARCH))
+SHA256SUM ?= sha256sum
+ifeq ($(shell command -v $(firstword $(SHA256SUM)) 2>/dev/null),)
+SHA256SUM := shasum -a 256
+endif
 INSTALL_LOCATION:=$(shell go env GOPATH)/bin
 GOLANGCI_LINT_VERSION ?= 2.9.0
 GOSEC_VERSION ?= 2.13.1
@@ -178,21 +198,37 @@ easy-rsa: easy-rsa.tar.gz
 
 cfssl:
 	@if ! command -v cfssl &> /dev/null; then \
-	if curl --output /dev/null --silent --head --fail $(CFSSL_URL); then \
+	if curl --output /dev/null --silent --head --fail "$(CFSSL_URL)"; then \
+		if [ -z "$(CFSSL_SHA256)" ]; then \
+			echo "No trusted SHA-256 checksum is configured for $(GOOS)/$(GOARCH); refusing to install cfssl."; \
+			exit 1; \
+		fi; \
 		echo "URL exists; Pulling prebuilt cfssl."; \
-		curl --retry 10 -L -o cfssljson $(CFSSL_URL); \
-		chmod +x cfssljson; \
+		curl --retry 10 -L --fail -o cfssl "$(CFSSL_URL)"; \
+		if ! printf '%s  %s\n' "$(CFSSL_SHA256)" cfssl | $(SHA256SUM) -c -; then \
+			echo "Checksum verification failed for cfssl."; \
+			exit 1; \
+		fi; \
+		chmod +x cfssl; \
 	else \
-		echo "URL does not exist; Building cfssljson."; \
+		echo "URL does not exist; Building cfssl."; \
 		GOBIN=`pwd` go install github.com/cloudflare/cfssl/cmd/...@v$(CFSSL_VERSION); \
 	fi \
 	fi
 
 cfssljson:
 	@if ! command -v cfssljson &> /dev/null; then \
-	if curl --output /dev/null --silent --head --fail $(CFSSLJSON_URL); then \
+	if curl --output /dev/null --silent --head --fail "$(CFSSLJSON_URL)"; then \
+		if [ -z "$(CFSSLJSON_SHA256)" ]; then \
+			echo "No trusted SHA-256 checksum is configured for $(GOOS)/$(GOARCH); refusing to install cfssljson."; \
+			exit 1; \
+		fi; \
 		echo "URL exists; Pulling prebuilt cfssljson."; \
-		curl --retry 10 -L -o cfssljson $(CFSSLJSON_URL); \
+		curl --retry 10 -L --fail -o cfssljson "$(CFSSLJSON_URL)"; \
+		if ! printf '%s  %s\n' "$(CFSSLJSON_SHA256)" cfssljson | $(SHA256SUM) -c -; then \
+			echo "Checksum verification failed for cfssljson."; \
+			exit 1; \
+		fi; \
 		chmod +x cfssljson; \
 	else \
 		echo "URL does not exist; Building cfssljson."; \
