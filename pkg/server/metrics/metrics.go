@@ -40,6 +40,8 @@ const (
 var (
 	// Use buckets ranging from 10 ns to 12.5 seconds.
 	latencyBuckets = []float64{0.000001, 0.00001, 0.0001, 0.005, 0.025, 0.1, 0.5, 2.5, 12.5}
+	// Use buckets ranging from 1 second to 24 hours.
+	connectionDurationBuckets = []float64{1, 5, 15, 30, 60, 300, 900, 1800, 3600, 14400, 43200, 86400}
 
 	// Metrics provides access to all dial metrics.
 	Metrics = newServerMetrics()
@@ -49,6 +51,7 @@ var (
 type ServerMetrics struct {
 	endpointLatencies    *prometheus.HistogramVec
 	frontendLatencies    *prometheus.HistogramVec
+	connectionDuration   *prometheus.HistogramVec
 	grpcConnections      *prometheus.GaugeVec
 	httpConnections      prometheus.Gauge
 	backend              *prometheus.GaugeVec
@@ -56,6 +59,8 @@ type ServerMetrics struct {
 	pendingDials         *prometheus.GaugeVec
 	establishedConns     *prometheus.GaugeVec
 	fullRecvChannels     *prometheus.GaugeVec
+	fullWriteQueues      *prometheus.GaugeVec
+	blockedWriteChannels *prometheus.GaugeVec
 	dialFailures         *prometheus.CounterVec
 	streamPackets        *prometheus.CounterVec
 	streamErrors         *prometheus.CounterVec
@@ -83,8 +88,18 @@ func newServerMetrics() *ServerMetrics {
 			Namespace: Namespace,
 			Subsystem: Subsystem,
 			Name:      "frontend_write_duration_seconds",
-			Help:      "Latency of write to the frontend in seconds",
+			Help:      "Frontend Send duration in seconds; when HTTP-CONNECT buffering is enabled, established traffic measures queue admission, not the asynchronous socket write.",
 			Buckets:   latencyBuckets,
+		},
+		[]string{},
+	)
+	connectionDuration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "connection_duration_seconds",
+			Help:      "Duration in seconds a proxied end-to-end connection was established (post-dial) before being closed.",
+			Buckets:   connectionDurationBuckets,
 		},
 		[]string{},
 	)
@@ -156,6 +171,24 @@ func newServerMetrics() *ServerMetrics {
 			"service_method",
 		},
 	)
+	fullFrontendWriteQueues := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "full_frontend_write_queues",
+			Help:      "Number of per-connection HTTP CONNECT frontend write queues currently at capacity.",
+		},
+		[]string{},
+	)
+	blockedFrontendWriteChannels := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: Subsystem,
+			Name:      "blocked_frontend_write_channels",
+			Help:      "Number of backend receive loops currently blocked enqueueing to a full HTTP CONNECT frontend write channel.",
+		},
+		[]string{},
+	)
 	dialFailures := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -213,6 +246,7 @@ func newServerMetrics() *ServerMetrics {
 	streamErrors := commonmetrics.MakeStreamErrorsTotalMetric(Namespace, Subsystem)
 	prometheus.MustRegister(endpointLatencies)
 	prometheus.MustRegister(frontendLatencies)
+	prometheus.MustRegister(connectionDuration)
 	prometheus.MustRegister(grpcConnections)
 	prometheus.MustRegister(httpConnections)
 	prometheus.MustRegister(backend)
@@ -220,6 +254,8 @@ func newServerMetrics() *ServerMetrics {
 	prometheus.MustRegister(pendingDials)
 	prometheus.MustRegister(establishedConns)
 	prometheus.MustRegister(fullRecvChannels)
+	prometheus.MustRegister(fullFrontendWriteQueues)
+	prometheus.MustRegister(blockedFrontendWriteChannels)
 	prometheus.MustRegister(dialFailures)
 	prometheus.MustRegister(streamPackets)
 	prometheus.MustRegister(streamErrors)
@@ -231,6 +267,7 @@ func newServerMetrics() *ServerMetrics {
 	return &ServerMetrics{
 		endpointLatencies:    endpointLatencies,
 		frontendLatencies:    frontendLatencies,
+		connectionDuration:   connectionDuration,
 		grpcConnections:      grpcConnections,
 		httpConnections:      httpConnections,
 		backend:              backend,
@@ -238,6 +275,8 @@ func newServerMetrics() *ServerMetrics {
 		pendingDials:         pendingDials,
 		establishedConns:     establishedConns,
 		fullRecvChannels:     fullRecvChannels,
+		fullWriteQueues:      fullFrontendWriteQueues,
+		blockedWriteChannels: blockedFrontendWriteChannels,
 		dialFailures:         dialFailures,
 		streamPackets:        streamPackets,
 		streamErrors:         streamErrors,
@@ -253,12 +292,15 @@ func newServerMetrics() *ServerMetrics {
 func (s *ServerMetrics) Reset() {
 	s.endpointLatencies.Reset()
 	s.frontendLatencies.Reset()
+	s.connectionDuration.Reset()
 	s.grpcConnections.Reset()
 	s.backend.Reset()
 	s.totalBackendCount.Reset()
 	s.pendingDials.Reset()
 	s.establishedConns.Reset()
 	s.fullRecvChannels.Reset()
+	s.fullWriteQueues.Reset()
+	s.blockedWriteChannels.Reset()
 	s.dialFailures.Reset()
 	s.streamPackets.Reset()
 	s.streamErrors.Reset()
@@ -274,7 +316,14 @@ func (s *ServerMetrics) ObserveDialLatency(elapsed time.Duration) {
 	s.endpointLatencies.WithLabelValues().Observe(elapsed.Seconds())
 }
 
-// ObserveFrontendWriteLatency records the latency of blocking on stream send to the client.
+// ObserveConnectionDuration records how long an established end-to-end connection remained open.
+func (s *ServerMetrics) ObserveConnectionDuration(elapsed time.Duration) {
+	s.connectionDuration.WithLabelValues().Observe(elapsed.Seconds())
+}
+
+// ObserveFrontendWriteLatency records how long the frontend Send call takes.
+// When HTTP-CONNECT buffering is enabled, established traffic measures waiting
+// for queue space, not the socket write performed later by the frontend writer.
 func (s *ServerMetrics) ObserveFrontendWriteLatency(elapsed time.Duration) {
 	s.frontendLatencies.WithLabelValues().Observe(elapsed.Seconds())
 }
@@ -318,6 +367,18 @@ func (s *ServerMetrics) SetEstablishedConnCount(count int) {
 // FullRecvChannel retrieves the metric for counting full receive channels.
 func (s *ServerMetrics) FullRecvChannel(serviceMethod string) prometheus.Gauge {
 	return s.fullRecvChannels.With(prometheus.Labels{"service_method": serviceMethod})
+}
+
+// FullFrontendWriteQueues returns the number of per-connection HTTP CONNECT
+// frontend write queues currently at capacity.
+func (s *ServerMetrics) FullFrontendWriteQueues() prometheus.Gauge {
+	return s.fullWriteQueues.WithLabelValues()
+}
+
+// BlockedFrontendWriteChannels returns the number of backend receive loops
+// currently blocked enqueueing to a full HTTP CONNECT frontend write channel.
+func (s *ServerMetrics) BlockedFrontendWriteChannels() prometheus.Gauge {
+	return s.blockedWriteChannels.WithLabelValues()
 }
 
 type DialFailureReason string
