@@ -19,14 +19,12 @@ package app
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	netpprof "net/http/pprof"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	runpprof "runtime/pprof"
 	"strconv"
@@ -41,6 +39,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
@@ -58,6 +57,7 @@ const (
 	LeaseDuration        = 30 * time.Second
 	LeaseRenewalInterval = 15 * time.Second
 	LeaseGCInterval      = 15 * time.Second
+	leaseCleanupTimeout  = 5 * time.Second
 )
 
 func NewProxyCommand(p *Proxy, o *options.ProxyRunOptions) *cobra.Command {
@@ -96,6 +96,16 @@ type Proxy struct {
 }
 
 type StopFunc func(context.Context) error
+
+func stopLeaseController(ctx context.Context, controller *leases.Controller) {
+	if controller == nil {
+		return
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(ctx, leaseCleanupTimeout)
+	defer cancel()
+	controller.Stop(cleanupCtx)
+}
 
 func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
@@ -192,13 +202,14 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	// If graceful shutdown timeout is 0, use the old behavior (immediate shutdown)
 	if o.GracefulShutdownTimeout == 0 {
 		if p.healthServer != nil {
-			p.healthServer.Close()
+			if err := p.healthServer.Close(); err != nil {
+				klog.ErrorS(err, "failed to close health server")
+			}
 		}
 		if p.adminServer != nil {
-			p.adminServer.Close()
-		}
-		if leaseController != nil {
-			leaseController.Stop()
+			if err := p.adminServer.Close(); err != nil {
+				klog.ErrorS(err, "failed to close admin server")
+			}
 		}
 		if p.agentServer != nil {
 			p.agentServer.Stop()
@@ -208,6 +219,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 				klog.ErrorS(err, "failed to stop frontend server")
 			}
 		}
+		stopLeaseController(ctx, leaseController)
 		return nil
 	}
 
@@ -287,10 +299,14 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 			p.agentServer.Stop()
 		}
 		if p.adminServer != nil {
-			p.adminServer.Close()
+			if err := p.adminServer.Close(); err != nil {
+				klog.ErrorS(err, "failed to close admin server")
+			}
 		}
 		if p.healthServer != nil {
-			p.healthServer.Close()
+			if err := p.healthServer.Close(); err != nil {
+				klog.ErrorS(err, "failed to close health server")
+			}
 		}
 		// frontend server's force-stop is handled by its StopFunc
 	}
@@ -298,7 +314,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	// Stop lease controller after servers have shut down
 	if leaseController != nil {
 		klog.V(1).Infoln("Stopping lease controller.")
-		leaseController.Stop()
+		stopLeaseController(ctx, leaseController)
 	}
 
 	return nil
@@ -422,14 +438,9 @@ func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []st
 		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: minVersion, CipherSuites: cipherSuiteIDs}, nil // #nosec G402
 	}
 
-	certPool := x509.NewCertPool()
-	caCert, err := os.ReadFile(filepath.Clean(caFile))
+	certPool, err := certutil.NewPool(caFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read cluster CA cert %s: %v", caFile, err)
-	}
-	ok := certPool.AppendCertsFromPEM(caCert)
-	if !ok {
-		return nil, fmt.Errorf("failed to append cluster CA cert to the cert pool")
+		return nil, fmt.Errorf("failed to load CA cert: %w", err)
 	}
 
 	tlsConfig := &tls.Config{ // #nosec G402

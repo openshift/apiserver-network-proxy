@@ -343,6 +343,37 @@ func TestFailedSend_DialResp_GRPC(t *testing.T) {
 	}()
 }
 
+func TestSendChannelToProxy_CleansUpOnSendFailure(t *testing.T) {
+	testClient := &Client{
+		cs:     &ClientSet{clients: make(map[string]*Client)},
+		stream: &brokenStream{sendErr: errors.New("expected send error")},
+	}
+
+	dialDone := make(chan struct{})
+	close(dialDone)
+	cleanupDone := make(chan struct{})
+	eConn := &endpointConn{
+		connID:   1,
+		dialDone: dialDone,
+		sendCh:   make(chan []byte, 1),
+		sendDone: make(chan struct{}),
+	}
+	eConn.cleanFunc = func() {
+		close(eConn.sendCh)
+		<-eConn.sendDone
+		close(cleanupDone)
+	}
+
+	go testClient.sendChannelToProxy(eConn.connID, eConn)
+	eConn.sendCh <- []byte("data")
+
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("send failure did not clean up endpoint")
+	}
+}
+
 func TestDrain(t *testing.T) {
 	drainCh := make(chan struct{})
 	stopCh := make(chan struct{})

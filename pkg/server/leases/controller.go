@@ -69,9 +69,9 @@ func (c *Controller) Run(ctx context.Context) {
 	go c.acquireController.Run(ctx)
 }
 
-func (c *Controller) Stop() {
+func (c *Controller) Stop(ctx context.Context) {
 	klog.Infof("Cleaning up server lease %q", c.leaseName)
-	err := c.k8sClient.CoordinationV1().Leases(c.leaseNamespace).Delete(context.Background(), c.leaseName, metav1.DeleteOptions{})
+	err := c.k8sClient.CoordinationV1().Leases(c.leaseNamespace).Delete(ctx, c.leaseName, metav1.DeleteOptions{})
 	if err != nil {
 		klog.Errorf("Could not clean up lease %q in namespace %q", c.leaseName, c.leaseNamespace)
 	}
