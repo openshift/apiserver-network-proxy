@@ -57,7 +57,6 @@ const (
 	LeaseDuration        = 30 * time.Second
 	LeaseRenewalInterval = 15 * time.Second
 	LeaseGCInterval      = 15 * time.Second
-	leaseCleanupTimeout  = 5 * time.Second
 )
 
 func NewProxyCommand(p *Proxy, o *options.ProxyRunOptions) *cobra.Command {
@@ -96,16 +95,6 @@ type Proxy struct {
 }
 
 type StopFunc func(context.Context) error
-
-func stopLeaseController(ctx context.Context, controller *leases.Controller) {
-	if controller == nil {
-		return
-	}
-
-	cleanupCtx, cancel := context.WithTimeout(ctx, leaseCleanupTimeout)
-	defer cancel()
-	controller.Stop(cleanupCtx)
-}
 
 func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
@@ -151,6 +140,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	}
 	p.server = server.NewProxyServer(o.ServerID, ps, o.ServerCount, authOpt, o.XfrChannelSize)
 	p.server.SetBackendDialTimeout(o.BackendDialTimeout)
+	p.server.SetFrontendWriteChannelSize(o.FrontendWriteChannelSize)
 
 	frontendStop, err := p.runFrontendServer(ctx, o, p.server)
 	if err != nil {
@@ -202,14 +192,13 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	// If graceful shutdown timeout is 0, use the old behavior (immediate shutdown)
 	if o.GracefulShutdownTimeout == 0 {
 		if p.healthServer != nil {
-			if err := p.healthServer.Close(); err != nil {
-				klog.ErrorS(err, "failed to close health server")
-			}
+			p.healthServer.Close()
 		}
 		if p.adminServer != nil {
-			if err := p.adminServer.Close(); err != nil {
-				klog.ErrorS(err, "failed to close admin server")
-			}
+			p.adminServer.Close()
+		}
+		if leaseController != nil {
+			leaseController.Stop()
 		}
 		if p.agentServer != nil {
 			p.agentServer.Stop()
@@ -219,7 +208,6 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 				klog.ErrorS(err, "failed to stop frontend server")
 			}
 		}
-		stopLeaseController(ctx, leaseController)
 		return nil
 	}
 
@@ -299,14 +287,10 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 			p.agentServer.Stop()
 		}
 		if p.adminServer != nil {
-			if err := p.adminServer.Close(); err != nil {
-				klog.ErrorS(err, "failed to close admin server")
-			}
+			p.adminServer.Close()
 		}
 		if p.healthServer != nil {
-			if err := p.healthServer.Close(); err != nil {
-				klog.ErrorS(err, "failed to close health server")
-			}
+			p.healthServer.Close()
 		}
 		// frontend server's force-stop is handled by its StopFunc
 	}
@@ -314,7 +298,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	// Stop lease controller after servers have shut down
 	if leaseController != nil {
 		klog.V(1).Infoln("Stopping lease controller.")
-		stopLeaseController(ctx, leaseController)
+		leaseController.Stop()
 	}
 
 	return nil
@@ -382,7 +366,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsGrpcFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -402,7 +386,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsHttpFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			udsListener, err := getUDSListener(ctx, o.UdsName)
 			if err != nil {
 				klog.ErrorS(err, "failed to get uds listener")
@@ -454,7 +438,7 @@ func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []st
 	return tlsConfig, nil
 }
 
-func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
+func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
 	var stop StopFunc
 
 	var tlsConfig *tls.Config
@@ -480,7 +464,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsGrpcFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -503,7 +487,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsHttpFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
@@ -524,7 +508,7 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 	addr := net.JoinHostPort(o.AgentBindAddress, strconv.Itoa(o.AgentPort))
 	agentServerOptions := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime, Timeout: o.KeepaliveTimeout}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             30 * time.Second,
 			PermitWithoutStream: true,
