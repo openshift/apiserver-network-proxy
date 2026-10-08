@@ -19,6 +19,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/metadata"
 
@@ -198,6 +200,7 @@ func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 }
 
 func TestRemovePendingDialForStream(t *testing.T) {
+	metrics.Metrics.Reset()
 	streamUID := "target-uuid"
 	pending1 := &ProxyClientConnection{frontend: &GrpcFrontend{streamUID: streamUID}}
 	pending2 := &ProxyClientConnection{}
@@ -219,13 +222,47 @@ func TestRemovePendingDialForStream(t *testing.T) {
 	if e, a := expectedPending, p.PendingDial.pendingDial; !reflect.DeepEqual(e, a) {
 		t.Errorf("expected %v, got %v", e, a)
 	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(3); err != nil {
+		t.Errorf("expected pending dial metric to be updated: %v", err)
+	}
 	p.PendingDial.removeForStream("")
 	if e, a := expectedPending, p.PendingDial.pendingDial; !reflect.DeepEqual(e, a) {
 		t.Errorf("expected %v, got %v", e, a)
 	}
 }
 
-func TestHTTPConnectTunnelBlockedBackendDialSendTimesOutCleansPendingDialAndRetiresBackend(t *testing.T) {
+func TestRemovePendingDialForBackend(t *testing.T) {
+	metrics.Metrics.Reset()
+	backend1 := &Backend{}
+	backend2 := &Backend{}
+	pending1 := &ProxyClientConnection{backend: backend1}
+	pending2 := &ProxyClientConnection{backend: backend1}
+	pending3 := &ProxyClientConnection{backend: backend2}
+	pending4 := &ProxyClientConnection{}
+	manager := NewPendingDialManager()
+	manager.Add(1, pending1)
+	manager.Add(2, pending2)
+	manager.Add(3, pending3)
+	manager.Add(4, pending4)
+
+	removed := manager.removeForBackend(backend1)
+	if !reflect.DeepEqual(removed, []*ProxyClientConnection{pending1, pending2}) &&
+		!reflect.DeepEqual(removed, []*ProxyClientConnection{pending2, pending1}) {
+		t.Fatalf("unexpected removed pending dials: %v", removed)
+	}
+	expected := map[int64]*ProxyClientConnection{3: pending3, 4: pending4}
+	if !reflect.DeepEqual(manager.pendingDial, expected) {
+		t.Fatalf("expected pending dials %v, got %v", expected, manager.pendingDial)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(2); err != nil {
+		t.Errorf("expected pending dial metric to be updated: %v", err)
+	}
+	if removed := manager.removeForBackend(nil); len(removed) != 0 {
+		t.Fatalf("nil backend removed pending dials: %v", removed)
+	}
+}
+
+func TestHTTPConnectTunnelBlockedBackendDialSendPreservesBackend(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -235,6 +272,9 @@ func TestHTTPConnectTunnelBlockedBackendDialSendTimesOutCleansPendingDialAndReti
 	proxyServer.SetBackendDialTimeout(500 * time.Millisecond)
 
 	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	const unrelatedConnID = int64(900)
+	unrelated := &ProxyClientConnection{backend: backend, agentID: backend.GetAgentID(), connectID: unrelatedConnID}
+	proxyServer.addEstablished(backend.GetAgentID(), unrelatedConnID, unrelated)
 	sendStarted := make(chan *client.Packet, 1)
 	releaseSend := make(chan struct{})
 	sendReleased := make(chan struct{})
@@ -305,17 +345,26 @@ func TestHTTPConnectTunnelBlockedBackendDialSendTimesOutCleansPendingDialAndReti
 	if got := pendingDialCount(proxyServer); got != 0 {
 		t.Fatalf("expected pending dial to be cleaned after backend dial timeout, got %d", got)
 	}
-	if !backend.IsDraining() {
-		t.Fatal("expected backend to be marked draining after backend dial timeout")
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureBackendDialTimeout, 1); err != nil {
+		t.Errorf("expected one backend dial timeout failure: %v", err)
+	}
+	if got, err := proxyServer.getFrontend(backend.GetAgentID(), unrelatedConnID); err != nil || got != unrelated {
+		t.Fatalf("unrelated established connection was removed: got %v, err %v", got, err)
+	}
+	if backend.IsDraining() {
+		t.Fatal("expected backend not to be marked draining after backend dial timeout")
 	}
 	select {
 	case <-backend.Done():
-	case <-time.After(time.Second):
-		t.Fatal("expected backend retire signal after backend dial timeout")
+		t.Fatal("expected backend Done channel to remain open after backend dial timeout")
+	default:
 	}
 	for _, bm := range proxyServer.BackendManagers {
-		if got := bm.NumBackends(); got != 0 {
-			t.Fatalf("expected timed-out backend to be retired from manager, got %d backends", got)
+		if got := bm.NumBackends(); got != 1 {
+			t.Fatalf("expected timed-out backend to remain in manager, got %d backends", got)
 		}
 	}
 
@@ -324,6 +373,1214 @@ func TestHTTPConnectTunnelBlockedBackendDialSendTimesOutCleansPendingDialAndReti
 	case <-sendReleased:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for blocked backend Send goroutine to exit")
+	}
+	fresh := &client.Packet{Type: client.PacketType_DATA}
+	agentConn.EXPECT().Send(fresh).Return(nil).Times(1)
+	if err := backend.Send(fresh); err != nil {
+		t.Fatalf("healthy backend could not send after dial timeout: %v", err)
+	}
+	proxyServer.removeEstablished(backend.GetAgentID(), unrelatedConnID)
+}
+
+func TestHTTPConnectDialResponseWinsTimeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	const dialTimeout = 100 * time.Millisecond
+	proxyServer.SetBackendDialTimeout(dialTimeout)
+	ownerClaimed := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	timeoutAttempted := make(chan struct{})
+	var releaseOwnerOnce sync.Once
+	proxyServer.beforeDialResultPublication = func() {
+		close(ownerClaimed)
+		<-releaseOwner
+	}
+	proxyServer.afterHTTPTimeoutDialRemoval = func() { close(timeoutAttempted) }
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	agentPackets := make(chan *client.Packet, 2)
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		agentPackets <- pkt
+		return nil
+	}).Times(2)
+
+	front := httptest.NewServer(&Tunnel{Server: proxyServer})
+	t.Cleanup(func() { closeHTTPTestServer(t, front) })
+	frontURL, err := url.Parse(front.URL)
+	if err != nil {
+		t.Fatalf("failed to parse front URL: %v", err)
+	}
+	conn, err := net.Dial("tcp", frontURL.Host)
+	if err != nil {
+		t.Fatalf("failed to connect to HTTP CONNECT front: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	reader := bufio.NewReader(conn)
+	if _, err := fmt.Fprintf(conn, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n"); err != nil {
+		t.Fatalf("failed to write CONNECT request: %v", err)
+	}
+
+	var dialReq *client.Packet
+	select {
+	case dialReq = <-agentPackets:
+		if dialReq.Type != client.PacketType_DIAL_REQ {
+			t.Fatalf("backend packet = %v, want DIAL_REQ", dialReq.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_REQ")
+	}
+	const connectID = int64(62)
+	recvCh := make(chan *client.Packet, 2)
+	backendDone := make(chan struct{})
+	go func() {
+		proxyServer.serveRecvBackend(backend, backend.GetAgentID(), recvCh)
+		close(backendDone)
+	}()
+	var recvOnce sync.Once
+	t.Cleanup(func() {
+		recvOnce.Do(func() { close(recvCh) })
+		select {
+		case <-backendDone:
+		case <-time.After(time.Second):
+			t.Errorf("timed out joining backend response handler during cleanup")
+		}
+	})
+	// Register this last so a failed handshake guard releases the paused owner
+	// before any cleanup waits for the backend or HTTP workers.
+	t.Cleanup(func() { releaseOwnerOnce.Do(func() { close(releaseOwner) }) })
+	recvCh <- dialRspPkt(dialReq.GetDialRequest().Random, connectID)
+	select {
+	case <-ownerClaimed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_RSP owner to remove the pending dial")
+	}
+	select {
+	case <-timeoutAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the real HTTP timeout branch to lose pending ownership")
+	}
+	releaseOwnerOnce.Do(func() { close(releaseOwner) })
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("failed to bound CONNECT response read: %v", err)
+	}
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("failed to read CONNECT response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT response = %s, want 200", resp.Status)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("failed to bound duplicate response read: %v", err)
+	}
+	if duplicate, err := http.ReadResponse(reader, nil); err == nil {
+		duplicate.Body.Close()
+		t.Fatalf("received duplicate terminal HTTP response: %s", duplicate.Status)
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("duplicate response read returned %v, want bounded timeout with active tunnel", err)
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("response winner left %d pending dials", got)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{}); err != nil {
+		t.Errorf("response winner recorded timeout failure: %v", err)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 1 {
+		t.Fatalf("expected one active HTTP connection, got %d", established)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("failed to close HTTP frontend: %v", err)
+	}
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Fatalf("unexpected tunnel cleanup packet: %v", pkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for HTTP tunnel cleanup")
+	}
+	recvCh <- &client.Packet{Type: client.PacketType_CLOSE_RSP, Payload: &client.Packet_CloseResponse{CloseResponse: &client.CloseResponse{ConnectID: connectID}}}
+	if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond, time.Second, true, func(context.Context) (bool, error) {
+		proxyServer.fmu.RLock()
+		defer proxyServer.fmu.RUnlock()
+		return proxyServer.getCount(proxyServer.established) == 0, nil
+	}); err != nil {
+		t.Fatalf("HTTP connection was retained after close response: %v", err)
+	}
+	recvOnce.Do(func() { close(recvCh) })
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend response handler")
+	}
+}
+
+func TestHTTPConnectBackendCloseWinsTimeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	const dialTimeout = 100 * time.Millisecond
+	proxyServer.SetBackendDialTimeout(dialTimeout)
+	ownerClaimed := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	timeoutAttempted := make(chan struct{})
+	var releaseOwnerOnce sync.Once
+	proxyServer.beforeDialResultPublication = func() {
+		close(ownerClaimed)
+		<-releaseOwner
+	}
+	proxyServer.afterHTTPTimeoutDialRemoval = func() { close(timeoutAttempted) }
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	dialSent := make(chan *client.Packet, 1)
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		dialSent <- pkt
+		return nil
+	}).Times(1)
+
+	front := httptest.NewServer(&Tunnel{Server: proxyServer})
+	t.Cleanup(func() { closeHTTPTestServer(t, front) })
+	frontURL, err := url.Parse(front.URL)
+	if err != nil {
+		t.Fatalf("failed to parse front URL: %v", err)
+	}
+	conn, err := net.Dial("tcp", frontURL.Host)
+	if err != nil {
+		t.Fatalf("failed to connect to HTTP CONNECT front: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	reader := bufio.NewReader(conn)
+	if _, err := fmt.Fprintf(conn, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n"); err != nil {
+		t.Fatalf("failed to write CONNECT request: %v", err)
+	}
+	select {
+	case pkt := <-dialSent:
+		if pkt.Type != client.PacketType_DIAL_REQ {
+			t.Fatalf("backend packet = %v, want DIAL_REQ", pkt.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_REQ")
+	}
+	recvCh := make(chan *client.Packet)
+	backendDone := make(chan struct{})
+	go func() {
+		proxyServer.serveRecvBackend(backend, backend.GetAgentID(), recvCh)
+		close(backendDone)
+	}()
+	close(recvCh)
+	t.Cleanup(func() {
+		select {
+		case <-backendDone:
+		case <-time.After(time.Second):
+			t.Errorf("timed out joining backend-close owner during cleanup")
+		}
+	})
+	// Register this last so a failed handshake guard releases the paused owner
+	// before any cleanup waits for the backend or HTTP workers.
+	t.Cleanup(func() { releaseOwnerOnce.Do(func() { close(releaseOwner) }) })
+	select {
+	case <-ownerClaimed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend-close owner to remove the pending dial")
+	}
+	select {
+	case <-timeoutAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the real HTTP timeout branch to lose pending ownership")
+	}
+	releaseOwnerOnce.Do(func() { close(releaseOwner) })
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend-close owner to publish completion")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("failed to bound backend-close response read: %v", err)
+	}
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("failed to read backend-close response: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("backend-close response = %s, want 502", resp.Status)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("failed to read backend-close response body: %v", err)
+	}
+	resp.Body.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("failed to bound duplicate response read: %v", err)
+	}
+	if _, err := http.ReadResponse(reader, nil); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected exactly one terminal HTTP response, second read error = %v", err)
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("backend close left %d pending dials", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("backend close retained %d established connections", established)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{
+		metrics.DialFailureBackendClose: 1,
+	}); err != nil {
+		t.Errorf("expected one backend-close failure and no timeout failure: %v", err)
+	}
+}
+
+func TestResolveDialSendOnContextDone(t *testing.T) {
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	success := make(chan error, 1)
+	success <- nil
+	if err := resolveDialSendOnContextDone(expired, success); err != nil {
+		t.Fatalf("buffered success returned error: %v", err)
+	}
+
+	empty := make(chan error, 1)
+	if err := resolveDialSendOnContextDone(expired, empty); !errors.Is(err, errBackendDialTimeout) {
+		t.Fatalf("expired context returned %v, want %v", err, errBackendDialTimeout)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := resolveDialSendOnContextDone(canceled, empty); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context returned %v, want context.Canceled", err)
+	}
+}
+
+func TestConfiguredPendingDialTimeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	proxyServer.SetBackendDialTimeout(10 * time.Millisecond)
+	_, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+	frontend := &GrpcFrontend{stream: frontendConn}
+	const dialID = int64(71)
+	done := make(chan struct{})
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID || pkt.GetDialResponse().Error != errBackendDialTimeout.Error() {
+			t.Errorf("unexpected timeout response: %v", pkt)
+		}
+		close(done)
+		return nil
+	}).Times(1)
+	proxyServer.PendingDial.Add(dialID, &ProxyClientConnection{
+		Mode:      ModeGRPC,
+		frontend:  frontend,
+		dialID:    dialID,
+		backend:   backend,
+		connected: make(chan struct{}),
+	})
+	proxyServer.startPendingDialTimeout(dialID, backend, frontend)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pending dial timeout")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("expected no pending dials, got %d", got)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureBackendDialTimeout, 1); err != nil {
+		t.Errorf("expected backend dial timeout failure metric: %v", err)
+	}
+}
+
+func TestBackendCloseFailsOnlyItsPendingDials(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	_, failedBackend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	_, healthyBackend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+
+	failedFrontendConn := prepareFrontendConn(ctrl)
+	failedFrontend := &GrpcFrontend{stream: failedFrontendConn}
+	responses := make(chan int64, 2)
+	failedFrontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		resp := pkt.GetDialResponse()
+		if pkt.Type != client.PacketType_DIAL_RSP || resp.Error != errBackendClosedWhileDialing.Error() {
+			t.Errorf("unexpected backend-close response: %v", pkt)
+		}
+		responses <- resp.Random
+		return nil
+	}).Times(2)
+
+	healthyFrontend := &GrpcFrontend{stream: prepareFrontendConn(ctrl)}
+	for _, dialID := range []int64{11, 12} {
+		proxyServer.PendingDial.Add(dialID, &ProxyClientConnection{
+			Mode:        ModeGRPC,
+			frontend:    failedFrontend,
+			dialID:      dialID,
+			backend:     failedBackend,
+			connected:   make(chan struct{}),
+			dialAddress: "127.0.0.1:443",
+		})
+	}
+	proxyServer.PendingDial.Add(21, &ProxyClientConnection{
+		Mode:      ModeGRPC,
+		frontend:  healthyFrontend,
+		dialID:    21,
+		backend:   healthyBackend,
+		connected: make(chan struct{}),
+	})
+
+	recvCh := make(chan *client.Packet)
+	close(recvCh)
+	proxyServer.serveRecvBackend(failedBackend, failedBackend.GetAgentID(), recvCh)
+
+	seen := map[int64]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case dialID := <-responses:
+			seen[dialID] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for backend-close response")
+		}
+	}
+	if !seen[11] || !seen[12] {
+		t.Fatalf("missing backend-close responses, got %v", seen)
+	}
+	if got := pendingDialCount(proxyServer); got != 1 {
+		t.Fatalf("expected only healthy backend dial to remain, got %d pending dials", got)
+	}
+	if got := proxyServer.PendingDial.Remove(21); got == nil || got.backend != healthyBackend {
+		t.Fatalf("healthy backend pending dial was not preserved: %v", got)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected pending dial metric to track final map: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureBackendClose, 2); err != nil {
+		t.Errorf("expected backend-close failures: %v", err)
+	}
+	for _, manager := range proxyServer.BackendManagers {
+		if got := manager.NumBackends(); got != 2 {
+			t.Errorf("backend cleanup changed ready backends: got %d, want 2", got)
+		}
+	}
+}
+
+func TestRepeatedBackendCloseChurnPreservesHealthyBackend(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	manager := proxyServer.BackendManagers[0].(*DefaultBackendManager)
+	const agentID = "shared-agent"
+
+	healthyConn := mockAgentConn(ctrl, agentID, nil)
+	healthyPackets := make(chan *client.Packet, 2)
+	healthyRecv := make(chan *client.Packet, 1)
+	healthyConn.EXPECT().SendHeader(gomock.Any()).Return(nil).Times(1)
+	healthyConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+		pkt, ok := <-healthyRecv
+		if !ok {
+			return nil, io.EOF
+		}
+		return pkt, nil
+	}).AnyTimes()
+	healthyDone := make(chan error, 1)
+	go func() { healthyDone <- proxyServer.Connect(healthyConn) }()
+	var healthyStopOnce sync.Once
+	defer func() { healthyStopOnce.Do(func() { close(healthyRecv) }) }()
+	if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond, time.Second, true, func(context.Context) (bool, error) {
+		return manager.NumBackends() == 1, nil
+	}); err != nil {
+		t.Fatalf("healthy backend did not register: %v", err)
+	}
+	manager.mu.RLock()
+	healthyBackend := manager.backends[agentID][0]
+	manager.mu.RUnlock()
+
+	const cycles = 8
+	for i := 0; i < cycles; i++ {
+		failedConn := mockAgentConn(ctrl, agentID, nil)
+		failedStop := make(chan struct{})
+		var failedStopOnce sync.Once
+		defer func() { failedStopOnce.Do(func() { close(failedStop) }) }()
+		failedConn.EXPECT().SendHeader(gomock.Any()).Return(nil).Times(1)
+		failedConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-failedStop
+			return nil, io.EOF
+		}).Times(1)
+		failedDone := make(chan error, 1)
+		go func() { failedDone <- proxyServer.Connect(failedConn) }()
+		if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond, time.Second, true, func(context.Context) (bool, error) {
+			manager.mu.RLock()
+			defer manager.mu.RUnlock()
+			return len(manager.backends[agentID]) == 2, nil
+		}); err != nil {
+			t.Fatalf("cycle %d: failed backend did not register: %v", i, err)
+		}
+		manager.mu.RLock()
+		var failedBackend *Backend
+		for _, candidate := range manager.backends[agentID] {
+			if candidate != healthyBackend {
+				failedBackend = candidate
+			}
+		}
+		manager.mu.RUnlock()
+		if failedBackend == nil {
+			t.Fatalf("cycle %d: could not identify failed backend", i)
+		}
+
+		dialID := int64(1000 + i)
+		frontendConn := prepareFrontendConn(ctrl)
+		failedResponse := make(chan struct{})
+		frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+			if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID || pkt.GetDialResponse().Error != errBackendClosedWhileDialing.Error() {
+				t.Errorf("cycle %d: unexpected backend-close response: %v", i, pkt)
+			}
+			close(failedResponse)
+			return nil
+		}).Times(1)
+		proxyServer.PendingDial.Add(dialID, &ProxyClientConnection{
+			Mode:        ModeGRPC,
+			frontend:    &GrpcFrontend{stream: frontendConn},
+			dialID:      dialID,
+			backend:     failedBackend,
+			connected:   make(chan struct{}),
+			dialAddress: "127.0.0.1:443",
+		})
+		failedStopOnce.Do(func() { close(failedStop) })
+		select {
+		case err := <-failedDone:
+			if err != nil {
+				t.Fatalf("cycle %d: failed backend Connect returned error: %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("cycle %d: failed backend worker did not join", i)
+		}
+		select {
+		case <-failedResponse:
+		case <-time.After(time.Second):
+			t.Fatalf("cycle %d: pending dial was not failed", i)
+		}
+		if got := pendingDialCount(proxyServer); got != 0 {
+			t.Fatalf("cycle %d: retained %d pending dials", i, got)
+		}
+		if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+			t.Errorf("cycle %d: pending gauge did not return to zero: %v", i, err)
+		}
+		manager.mu.RLock()
+		remaining := append([]*Backend(nil), manager.backends[agentID]...)
+		manager.mu.RUnlock()
+		if len(remaining) != 1 || remaining[0] != healthyBackend {
+			t.Fatalf("cycle %d: exact failed backend was not removed; remaining %v", i, remaining)
+		}
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureBackendClose, cycles); err != nil {
+		t.Errorf("expected one backend-close failure per churn cycle: %v", err)
+	}
+
+	// Complete a fresh production frontend dial through the surviving stream.
+	const dialID = int64(2000)
+	const connectID = int64(2001)
+	healthyConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		healthyPackets <- pkt
+		return nil
+	}).Times(2)
+	frontendConn := prepareFrontendConn(ctrl)
+	allowEOF := make(chan struct{})
+	gomock.InOrder(
+		frontendConn.EXPECT().Recv().Return(dialReqPkt(dialID), nil),
+		frontendConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-allowEOF
+			return nil, io.EOF
+		}),
+	)
+	dialSucceeded := make(chan struct{})
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().ConnectID != connectID {
+			t.Errorf("unexpected survivor response: %v", pkt)
+		}
+		close(dialSucceeded)
+		return nil
+	}).Times(1)
+	proxyDone := make(chan error, 1)
+	go func() { proxyDone <- proxyServer.Proxy(frontendConn) }()
+	select {
+	case pkt := <-healthyPackets:
+		if pkt.Type != client.PacketType_DIAL_REQ {
+			t.Fatalf("surviving backend packet = %v, want DIAL_REQ", pkt.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh dial did not use the surviving backend")
+	}
+	healthyRecv <- dialRspPkt(dialID, connectID)
+	select {
+	case <-dialSucceeded:
+	case <-time.After(time.Second):
+		t.Fatal("surviving backend did not complete a fresh dial")
+	}
+	if ready, _ := proxyServer.Readiness.Ready(); !ready {
+		t.Fatal("readiness was not healthy with the surviving backend")
+	}
+	close(allowEOF)
+	select {
+	case err := <-proxyDone:
+		if err != nil {
+			t.Fatalf("fresh frontend Proxy returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh frontend worker did not join")
+	}
+	select {
+	case pkt := <-healthyPackets:
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Fatalf("unexpected survivor cleanup packet: %v", pkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh connection was not cleaned from the surviving backend")
+	}
+
+	healthyStopOnce.Do(func() { close(healthyRecv) })
+	select {
+	case err := <-healthyDone:
+		if err != nil {
+			t.Fatalf("healthy backend Connect returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("healthy backend worker did not join")
+	}
+	if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond, time.Second, true, func(context.Context) (bool, error) {
+		return manager.NumBackends() == 0, nil
+	}); err != nil {
+		t.Fatalf("healthy backend was not removed after shutdown: %v", err)
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("churn test finished with %d pending dials", got)
+	}
+}
+
+func TestFrontendCloseCleansPendingDialAndMetric(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+	const dialID = int64(31)
+	const connectID = int64(32)
+	dialReq := dialReqPkt(dialID)
+	gomock.InOrder(
+		frontendConn.EXPECT().Recv().Return(dialReq, nil),
+		frontendConn.EXPECT().Recv().Return(nil, io.EOF),
+	)
+	gomock.InOrder(
+		agentConn.EXPECT().Send(dialReq).Return(nil),
+		agentConn.EXPECT().Send(dialClosePkt(dialID)).Return(nil),
+		agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+			if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+				t.Errorf("unexpected late-response cleanup packet: %v", pkt)
+			}
+			return nil
+		}),
+	)
+
+	if err := proxyServer.Proxy(frontendConn); err != nil {
+		t.Fatalf("Proxy returned error: %v", err)
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("expected no pending dials, got %d", got)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+
+	recvCh := make(chan *client.Packet, 1)
+	recvCh <- dialRspPkt(dialID, connectID)
+	close(recvCh)
+	proxyServer.serveRecvBackend(backend, backend.GetAgentID(), recvCh)
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("late response recreated pending state: %d", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("late response recreated established state: %d", established)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("late response changed the zero pending dial metric: %v", err)
+	}
+	assertEstablishedConnsMetric(t, 0)
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{
+		metrics.DialFailureUnrecognizedResponse: 1,
+	}); err != nil {
+		t.Errorf("expected exactly one unrecognized late response: %v", err)
+	}
+}
+
+func TestDialResponseRaceWithSendTimeoutPreservesSuccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	const dialTimeout = 100 * time.Millisecond
+	proxyServer.SetBackendDialTimeout(dialTimeout)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+
+	const dialID = int64(41)
+	const connectID = int64(42)
+	dialReq := dialReqPkt(dialID)
+	data := &client.Packet{
+		Type: client.PacketType_DATA,
+		Payload: &client.Packet_Data{Data: &client.Data{
+			ConnectID: connectID,
+			Data:      []byte("still-alive"),
+		}},
+	}
+	allowData := make(chan struct{})
+	allowEOF := make(chan struct{})
+	gomock.InOrder(
+		frontendConn.EXPECT().Recv().Return(dialReq, nil),
+		frontendConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-allowData
+			return data, nil
+		}),
+		frontendConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-allowEOF
+			return nil, io.EOF
+		}),
+	)
+
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	agentPackets := make(chan *client.Packet, 3)
+	var releaseOnce sync.Once
+	var dataOnce sync.Once
+	var eofOnce sync.Once
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		agentPackets <- pkt
+		switch pkt.Type {
+		case client.PacketType_DIAL_REQ:
+			close(sendStarted)
+			<-releaseSend
+			return nil
+		case client.PacketType_DATA, client.PacketType_CLOSE_REQ:
+			return nil
+		default:
+			return fmt.Errorf("unexpected packet sent to backend: %v", pkt.Type)
+		}
+	}).Times(3)
+
+	responseSent := make(chan struct{})
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		resp := pkt.GetDialResponse()
+		if pkt.Type != client.PacketType_DIAL_RSP || resp.Random != dialID || resp.ConnectID != connectID || resp.Error != "" {
+			t.Errorf("unexpected dial response: %v", pkt)
+		}
+		close(responseSent)
+		return nil
+	}).Times(1)
+
+	backendRecvCh := make(chan *client.Packet, 1)
+	backendDone := make(chan struct{})
+	var backendCloseOnce sync.Once
+	go func() {
+		proxyServer.serveRecvBackend(backend, backend.GetAgentID(), backendRecvCh)
+		close(backendDone)
+	}()
+	proxyDone := make(chan error, 1)
+	go func() {
+		proxyDone <- proxyServer.Proxy(frontendConn)
+	}()
+	t.Cleanup(func() {
+		dataOnce.Do(func() { close(allowData) })
+		eofOnce.Do(func() { close(allowEOF) })
+		releaseOnce.Do(func() { close(releaseSend) })
+		backendCloseOnce.Do(func() { close(backendRecvCh) })
+		select {
+		case <-backendDone:
+		case <-time.After(time.Second):
+		}
+	})
+
+	select {
+	case <-sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_REQ send")
+	}
+	backendRecvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{
+			Random:    dialID,
+			ConnectID: connectID,
+		}},
+	}
+	select {
+	case <-responseSent:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful DIAL_RSP")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("expected response to own the dial, got %d pending", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 1 {
+		t.Fatalf("expected exactly one established connection while active, got %d", established)
+	}
+
+	// Keep the transport Send blocked beyond the real configured deadline.
+	select {
+	case <-time.After(dialTimeout + dialTimeout/2):
+	case <-proxyDone:
+		t.Fatal("frontend ended before the configured dial-send deadline elapsed")
+	}
+	dataOnce.Do(func() { close(allowData) })
+	releaseOnce.Do(func() { close(releaseSend) })
+
+	for _, wantType := range []client.PacketType{client.PacketType_DIAL_REQ, client.PacketType_DATA} {
+		select {
+		case pkt := <-agentPackets:
+			if pkt.Type != wantType {
+				t.Fatalf("backend packet type = %v, want %v", pkt.Type, wantType)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for backend packet %v", wantType)
+		}
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{}); err != nil {
+		t.Errorf("response winner recorded a timeout failure: %v", err)
+	}
+
+	eofOnce.Do(func() { close(allowEOF) })
+	select {
+	case err := <-proxyDone:
+		if err != nil {
+			t.Fatalf("Proxy returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Proxy to finish")
+	}
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Fatalf("unexpected cleanup packet: %v", pkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for established connection cleanup")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("expected no pending dials, got %d", got)
+	}
+	proxyServer.fmu.RLock()
+	established = proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("expected no established connections after frontend close, got %d", established)
+	}
+	for _, manager := range proxyServer.BackendManagers {
+		if got := manager.NumBackends(); got != 1 {
+			t.Fatalf("send timeout removed healthy backend: got %d backends", got)
+		}
+	}
+	backendCloseOnce.Do(func() { close(backendRecvCh) })
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend receiver to finish")
+	}
+}
+
+func TestDialResponseFrontendShutdownDuringDeliveryCleansConnection(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+
+	const dialID = int64(45)
+	const connectID = int64(46)
+	dialReq := dialReqPkt(dialID)
+	allowEOF := make(chan struct{})
+	gomock.InOrder(
+		frontendConn.EXPECT().Recv().Return(dialReq, nil),
+		frontendConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-allowEOF
+			return nil, io.EOF
+		}),
+	)
+
+	deliveryStarted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().ConnectID != connectID {
+			t.Errorf("unexpected successful response: %v", pkt)
+		}
+		close(deliveryStarted)
+		<-releaseDelivery
+		return nil
+	}).Times(1)
+
+	agentPackets := make(chan *client.Packet, 2)
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		agentPackets <- pkt
+		return nil
+	}).Times(2)
+
+	backendRecvCh := make(chan *client.Packet, 1)
+	backendDone := make(chan struct{})
+	go func() {
+		proxyServer.serveRecvBackend(backend, backend.GetAgentID(), backendRecvCh)
+		close(backendDone)
+	}()
+	proxyDone := make(chan error, 1)
+	go func() { proxyDone <- proxyServer.Proxy(frontendConn) }()
+
+	var eofOnce, deliveryOnce, backendOnce sync.Once
+	t.Cleanup(func() {
+		eofOnce.Do(func() { close(allowEOF) })
+		deliveryOnce.Do(func() { close(releaseDelivery) })
+		backendOnce.Do(func() { close(backendRecvCh) })
+		select {
+		case <-backendDone:
+		case <-time.After(time.Second):
+		}
+	})
+
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_DIAL_REQ {
+			t.Fatalf("first backend packet = %v, want DIAL_REQ", pkt.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_REQ")
+	}
+	backendRecvCh <- dialRspPkt(dialID, connectID)
+	select {
+	case <-deliveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response delivery to pause")
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 1 {
+		t.Fatalf("response was exposed before established ownership: got %d established", established)
+	}
+
+	eofOnce.Do(func() { close(allowEOF) })
+	select {
+	case err := <-proxyDone:
+		if err != nil {
+			t.Fatalf("Proxy returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for frontend shutdown")
+	}
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Fatalf("unexpected backend cleanup packet: %v", pkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for agent-side connection cleanup")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("frontend shutdown retained %d pending dials", got)
+	}
+	proxyServer.fmu.RLock()
+	established = proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("frontend shutdown retained %d established connections", established)
+	}
+
+	deliveryOnce.Do(func() { close(releaseDelivery) })
+	backendOnce.Do(func() { close(backendRecvCh) })
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend response handler")
+	}
+}
+
+func TestDialResponseFrontendShutdownDuringPromotionCleansConnection(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+
+	const dialID = int64(47)
+	const connectID = int64(48)
+	allowEOF := make(chan struct{})
+	promotionPaused := make(chan struct{})
+	releasePromotion := make(chan struct{})
+	cleanupContended := make(chan struct{})
+	var eofOnce, promotionOnce, backendOnce sync.Once
+	proxyServer.afterPendingDialRemoval = func() {
+		close(promotionPaused)
+		<-releasePromotion
+	}
+	proxyServer.afterFrontendStreamLockContention = func() { close(cleanupContended) }
+
+	gomock.InOrder(
+		frontendConn.EXPECT().Recv().Return(dialReqPkt(dialID), nil),
+		frontendConn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+			<-allowEOF
+			return nil, io.EOF
+		}),
+	)
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID || pkt.GetDialResponse().ConnectID != connectID {
+			t.Errorf("unexpected successful response: %v", pkt)
+		}
+		return nil
+	}).Times(1)
+
+	agentPackets := make(chan *client.Packet, 2)
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		agentPackets <- pkt
+		return nil
+	}).Times(2)
+
+	backendRecvCh := make(chan *client.Packet, 1)
+	backendDone := make(chan struct{})
+	go func() {
+		proxyServer.serveRecvBackend(backend, backend.GetAgentID(), backendRecvCh)
+		close(backendDone)
+	}()
+	proxyDone := make(chan error, 1)
+	go func() { proxyDone <- proxyServer.Proxy(frontendConn) }()
+	t.Cleanup(func() {
+		eofOnce.Do(func() { close(allowEOF) })
+		promotionOnce.Do(func() { close(releasePromotion) })
+		backendOnce.Do(func() { close(backendRecvCh) })
+		select {
+		case <-backendDone:
+		case <-time.After(time.Second):
+		}
+	})
+
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_DIAL_REQ {
+			t.Fatalf("first backend packet = %v, want DIAL_REQ", pkt.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DIAL_REQ")
+	}
+	backendRecvCh <- dialRspPkt(dialID, connectID)
+	select {
+	case <-promotionPaused:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting in the real pending-removal-to-established-add transition")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("promotion did not remove pending ownership: got %d pending dials", got)
+	}
+	eofOnce.Do(func() { close(allowEOF) })
+	select {
+	case <-cleanupContended:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for frontend shutdown to contend on ownershipMu")
+	}
+	select {
+	case err := <-proxyDone:
+		t.Fatalf("frontend cleanup completed inside the ownership transition: %v", err)
+	default:
+	}
+
+	promotionOnce.Do(func() { close(releasePromotion) })
+	select {
+	case err := <-proxyDone:
+		if err != nil {
+			t.Fatalf("Proxy returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for frontend shutdown after promotion release")
+	}
+	select {
+	case pkt := <-agentPackets:
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Fatalf("unexpected agent-side cleanup packet: %v", pkt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for agent-side connection cleanup")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("frontend shutdown retained %d pending dials", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("frontend shutdown retained %d established connections", established)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	assertEstablishedConnsMetric(t, 0)
+
+	backendOnce.Do(func() { close(backendRecvCh) })
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend response handler")
+	}
+}
+
+func TestDialResponseSendErrorRollsBackEstablishedConnection(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	frontendConn := prepareFrontendConn(ctrl)
+
+	const dialID = int64(49)
+	const connectID = int64(50)
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID || pkt.GetDialResponse().ConnectID != connectID {
+			t.Errorf("unexpected successful response: %v", pkt)
+		}
+		return errors.New("frontend delivery failed")
+	}).Times(1)
+	closeSent := make(chan struct{})
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Errorf("unexpected rollback packet: %v", pkt)
+		}
+		close(closeSent)
+		return nil
+	}).Times(1)
+	proxyServer.PendingDial.Add(dialID, &ProxyClientConnection{
+		Mode:        ModeGRPC,
+		frontend:    &GrpcFrontend{stream: frontendConn, streamUID: "send-error-stream"},
+		dialID:      dialID,
+		backend:     backend,
+		connected:   make(chan struct{}),
+		dialAddress: "127.0.0.1:443",
+	})
+
+	recvCh := make(chan *client.Packet, 1)
+	recvCh <- dialRspPkt(dialID, connectID)
+	close(recvCh)
+	proxyServer.serveRecvBackend(backend, backend.GetAgentID(), recvCh)
+	select {
+	case <-closeSent:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend CLOSE_REQ rollback")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("delivery rollback retained %d pending dials", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("delivery rollback retained %d established connections", established)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric: %v", err)
+	}
+	assertEstablishedConnsMetric(t, 0)
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{
+		metrics.DialFailureSendResponse: 1,
+	}); err != nil {
+		t.Errorf("expected exactly one send-response failure: %v", err)
+	}
+}
+
+func TestLateDialResponseCleanup(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metrics.Metrics.Reset()
+	proxyServer := NewProxyServer(uuid.New().String(), []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, &AgentTokenAuthenticationOptions{}, xfrChannelSize)
+	proxyServer.SetBackendDialTimeout(10 * time.Millisecond)
+	agentConn, backend := prepareAgentConnMD(t, ctrl, proxyServer, nil)
+	const dialID = int64(51)
+	const connectID = int64(52)
+	frontendConn := prepareFrontendConn(ctrl)
+	frontend := &GrpcFrontend{stream: frontendConn}
+	timedOut := make(chan struct{})
+	frontendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID || pkt.GetDialResponse().Error != errBackendDialTimeout.Error() {
+			t.Errorf("unexpected timeout response: %v", pkt)
+		}
+		close(timedOut)
+		return nil
+	}).Times(1)
+	proxyServer.PendingDial.Add(dialID, &ProxyClientConnection{
+		Mode:        ModeGRPC,
+		frontend:    frontend,
+		dialID:      dialID,
+		backend:     backend,
+		connected:   make(chan struct{}),
+		dialAddress: "127.0.0.1:443",
+	})
+	proxyServer.startPendingDialTimeout(dialID, backend, frontend)
+	select {
+	case <-timedOut:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the real pending dial to be removed")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("timeout left %d pending dials", got)
+	}
+	if err := metricstest.DefaultTester.ExpectServerPendingDials(0); err != nil {
+		t.Errorf("expected zero pending dial metric after timeout: %v", err)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailure(metrics.DialFailureBackendDialTimeout, 1); err != nil {
+		t.Errorf("expected one primary timeout failure: %v", err)
+	}
+
+	closeSent := make(chan struct{})
+	agentConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type != client.PacketType_CLOSE_REQ || pkt.GetCloseRequest().ConnectID != connectID {
+			t.Errorf("unexpected late-response cleanup packet: %v", pkt)
+		}
+		close(closeSent)
+		return nil
+	}).Times(1)
+
+	recvCh := make(chan *client.Packet, 1)
+	recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{
+			Random:    dialID,
+			ConnectID: connectID,
+		}},
+	}
+	close(recvCh)
+	proxyServer.serveRecvBackend(backend, backend.GetAgentID(), recvCh)
+	select {
+	case <-closeSent:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for late-response cleanup")
+	}
+	if got := pendingDialCount(proxyServer); got != 0 {
+		t.Fatalf("late response recreated pending state: %d", got)
+	}
+	proxyServer.fmu.RLock()
+	established := proxyServer.getCount(proxyServer.established)
+	proxyServer.fmu.RUnlock()
+	if established != 0 {
+		t.Fatalf("late response recreated established state: %d", established)
+	}
+	if err := metricstest.DefaultTester.ExpectServerDialFailures(map[metrics.DialFailureReason]int{
+		metrics.DialFailureBackendDialTimeout:   1,
+		metrics.DialFailureUnrecognizedResponse: 1,
+	}); err != nil {
+		t.Errorf("expected unrecognized response metric: %v", err)
 	}
 }
 
@@ -1037,6 +2294,31 @@ func dialReqPkt(dialID int64) *client.Packet {
 				Random:   dialID,
 			},
 		},
+	}
+}
+
+func closeHTTPTestServer(t testing.TB, server *httptest.Server) {
+	t.Helper()
+	server.CloseClientConnections()
+	done := make(chan struct{})
+	go func() {
+		server.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Errorf("timed out joining HTTP test server during cleanup")
+	}
+}
+
+func dialRspPkt(dialID, connectID int64) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{
+			Random:    dialID,
+			ConnectID: connectID,
+		}},
 	}
 }
 

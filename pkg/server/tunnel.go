@@ -112,42 +112,34 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return nil
 		},
-		connected: connected,
-		start:     time.Now(),
-		backend:   backend,
-		dialID:    random,
-		agentID:   backend.GetAgentID(),
+		connected:                   connected,
+		dialResult:                  make(chan bool, 1),
+		beforeDialResultPublication: t.Server.beforeDialResultPublication,
+		afterHTTPTimeoutDialRemoval: t.Server.afterHTTPTimeoutDialRemoval,
+		start:                       time.Now(),
+		backend:                     backend,
+		dialID:                      random,
+		agentID:                     backend.GetAgentID(),
 	}
 	t.Server.PendingDial.Add(random, connection)
 
-	// This defer acts as a safeguard to ensure we clean up the pending dial
-	// if the connection is never successfully established.
-	established := false
-	dialFailureObserved := false
-	defer func() {
-		if !established {
-			if t.Server.PendingDial.Remove(random) != nil {
-				if !dialFailureObserved {
-					metrics.Metrics.ObserveDialFailure(metrics.DialFailureFrontendClose)
-				}
-			}
-		}
-	}()
-
 	if err := t.Server.sendDialRequestToBackend(backend, dialRequest); err != nil {
 		klog.ErrorS(err, "failed to tunnel dial request", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
-		dialFailureObserved = true
 		statusCode := http.StatusBadGateway
 		reason := metrics.DialFailureBackendClose
 		if errors.Is(err, errBackendDialTimeout) {
 			statusCode = http.StatusGatewayTimeout
 			reason = metrics.DialFailureBackendDialTimeout
 		}
-		metrics.Metrics.ObserveDialFailure(reason)
-		statusText := http.StatusText(statusCode)
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nFailed to tunnel dial request: %v\r\n", statusCode, statusText, err)))
-		// The deferred cleanup will run when we return here.
-		return
+		if t.Server.PendingDial.Remove(random) != nil {
+			metrics.Metrics.ObserveDialFailure(reason)
+			statusText := http.StatusText(statusCode)
+			conn.Write([]byte(fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nFailed to tunnel dial request: %v\r\n", statusCode, statusText, err)))
+			return
+		}
+		// A response or backend teardown already claimed this dial. Wait for
+		// that owner to publish the outcome instead of emitting a second
+		// terminal response.
 	}
 
 	ctxt := backend.Context()
@@ -159,45 +151,57 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		timeoutCh = dialTimer.C
 	}
 
-	select {
-	case <-connection.connected: // Waiting for response before we begin full communication.
-		// The connection is successful. Mark it as established so the deferred
-		// cleanup function knows not to remove it from PendingDial.
-		established = true
-
-		// Now that connection is established, send 200 OK to switch to tunnel mode
-		_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		if err != nil {
-			klog.ErrorS(err, "failed to send 200 connection established", "host", r.Host, "agentID", connection.agentID)
-			// We return here, but since `established` is true, the deferred
-			// function will not remove the pending dial. The agent-side goroutine
-			// is responsible for the established connection now.
-			return
+	established := false
+	closedCh := (<-chan struct{})(closed)
+	backendDone := ctxt.Done()
+	for !established {
+		select {
+		case established = <-connection.dialResult:
+			if !established {
+				return
+			}
+		case <-closedCh: // Connection was closed by the client before being established.
+			klog.V(2).InfoS("Frontend connection closed before being established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
+			if t.Server.PendingDial.Remove(random) != nil {
+				metrics.Metrics.ObserveDialFailure(metrics.DialFailureFrontendClose)
+				t.Server.sendBackendDialClose(backend, random, "frontend connection closed")
+				return
+			}
+			// Another owner removed the dial. Disable this already-fired case
+			// and wait for that owner to publish success or failure.
+			closedCh = nil
+		case <-backendDone: // Backend connection died before being established.
+			klog.ErrorS(ctxt.Err(), "backend context closed before connection was established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
+			if t.Server.PendingDial.Remove(random) != nil {
+				metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendClose)
+				conn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBackend context error: %v\r\n", ctxt.Err())))
+				return
+			}
+			backendDone = nil
+		case <-timeoutCh:
+			klog.ErrorS(errBackendDialTimeout, "backend dial timed out before connection was established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
+			if t.Server.PendingDial.Remove(random) != nil {
+				metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendDialTimeout)
+				conn.Write([]byte(fmt.Sprintf("HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBackend dial timeout: %v\r\n", errBackendDialTimeout)))
+				return
+			}
+			if connection.afterHTTPTimeoutDialRemoval != nil {
+				connection.afterHTTPTimeoutDialRemoval()
+			}
+			timeoutCh = nil
 		}
-		klog.V(3).InfoS("Connection established, sent 200 OK", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
+	}
 
-	case <-closed: // Connection was closed by the client before being established
-		klog.V(2).InfoS("Frontend connection closed before being established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
-		// The deferred cleanup will run when we return here.
-		return
-
-	case <-ctxt.Done(): // Backend connection died before being established
-		klog.ErrorS(ctxt.Err(), "backend context closed before connection was established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
-		metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendClose)
-		dialFailureObserved = true
-		// Send proper HTTP error response
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBackend context error: %v\r\n", ctxt.Err())))
-		// The deferred cleanup will run when we return here.
-		return
-
-	case <-timeoutCh:
-		klog.ErrorS(errBackendDialTimeout, "backend dial timed out before connection was established", "host", r.Host, "dialID", connection.dialID, "agentID", connection.agentID)
-		metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendDialTimeout)
-		dialFailureObserved = true
-		conn.Write([]byte(fmt.Sprintf("HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBackend dial timeout: %v\r\n", errBackendDialTimeout)))
-		// The deferred cleanup will run when we return here.
+	// Now that connection is established, send 200 OK to switch to tunnel mode.
+	_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		klog.ErrorS(err, "failed to send 200 connection established", "host", r.Host, "agentID", connection.agentID)
+		if t.Server.removeEstablished(connection.agentID, connection.connectID) != nil {
+			t.Server.sendBackendClose(backend, connection.connectID, connection.dialID, "frontend response failed")
+		}
 		return
 	}
+	klog.V(3).InfoS("Connection established, sent 200 OK", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
 
 	defer func() {
 		packet := &client.Packet{

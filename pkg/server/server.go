@@ -94,19 +94,39 @@ const defaultBackendDialTimeout = 0
 
 var errBackendDialTimeout = errors.New("timed out waiting for backend dial")
 
+var errBackendClosedWhileDialing = errors.New("backend connection closed while dialing")
+
 type ProxyClientConnection struct {
-	Mode          string
-	HTTP          io.ReadWriter
-	frontend      *GrpcFrontend
-	CloseHTTP     func() error
-	connected     chan struct{}
-	dialID        int64
-	connectID     int64
-	agentID       string
-	start         time.Time
-	establishedAt time.Time
-	backend       *Backend
-	dialAddress   string // cached for logging
+	Mode      string
+	HTTP      io.ReadWriter
+	frontend  *GrpcFrontend
+	CloseHTTP func() error
+	connected chan struct{}
+	// dialResult is used by HTTP CONNECT to learn the outcome after another
+	// goroutine has atomically claimed the pending dial. A true value means the
+	// connection was added to established before the result was published.
+	dialResult chan bool
+	// The following hooks are used by concurrency tests to pause after a
+	// terminal owner has claimed the real pending dial and to observe a losing
+	// HTTP timeout attempt. They are set before the tested contenders start.
+	beforeDialResultPublication func()
+	afterHTTPTimeoutDialRemoval func()
+	dialID                      int64
+	connectID                   int64
+	agentID                     string
+	start                       time.Time
+	establishedAt               time.Time
+	backend                     *Backend
+	dialAddress                 string // cached for logging
+}
+
+func (c *ProxyClientConnection) publishDialResult(established bool) {
+	if c.dialResult != nil {
+		if c.beforeDialResultPublication != nil {
+			c.beforeDialResultPublication()
+		}
+		c.dialResult <- established
+	}
 }
 
 const (
@@ -229,6 +249,26 @@ func (pm *PendingDialManager) Remove(random int64) *ProxyClientConnection {
 	return pd
 }
 
+// removeForBackend removes and returns all pending ProxyClientConnection whose
+// DIAL_REQ was sent over the given backend connection. They cannot complete
+// after that connection closes.
+func (pm *PendingDialManager) removeForBackend(backend *Backend) []*ProxyClientConnection {
+	var ret []*ProxyClientConnection
+	if backend == nil {
+		return ret
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for dialID, frontend := range pm.pendingDial {
+		if frontend.backend == backend {
+			delete(pm.pendingDial, dialID)
+			ret = append(ret, frontend)
+		}
+	}
+	metrics.Metrics.SetPendingDialCount(len(pm.pendingDial))
+	return ret
+}
+
 // removeForStream removes and returns all pending ProxyClientConnection associated with a
 // given Proxy gRPC connection (expected to be at most 1 while konnectivity-client API gives
 // single-use tunnels).
@@ -248,6 +288,7 @@ func (pm *PendingDialManager) removeForStream(streamUID string) []*ProxyClientCo
 			ret = append(ret, frontend)
 		}
 	}
+	metrics.Metrics.SetPendingDialCount(len(pm.pendingDial))
 	return ret
 }
 
@@ -269,6 +310,16 @@ type ProxyServer struct {
 	established map[string]map[int64]*ProxyClientConnection
 
 	PendingDial *PendingDialManager
+	// ownershipMu serializes a successful pending-to-established promotion
+	// with frontend-stream cleanup. Lock order is ownershipMu followed by a
+	// single pending or established map lock; map locks are never held while
+	// acquiring ownershipMu or while doing network I/O.
+	ownershipMu sync.Mutex
+	// Test hooks run at the two contested ownership boundaries.
+	afterPendingDialRemoval           func()
+	afterFrontendStreamLockContention func()
+	beforeDialResultPublication       func()
+	afterHTTPTimeoutDialRemoval       func()
 
 	serverID    string // unique ID of this server
 	serverCount int    // Number of proxy server instances, should be 1 unless it is a HA server.
@@ -330,24 +381,38 @@ func (s *ProxyServer) sendDialRequestToBackend(backend *Backend, pkt *client.Pac
 		return backend.Send(pkt)
 	}
 
+	ctx, cancel := context.WithTimeout(backend.Context(), timeout)
+	defer cancel()
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- backend.Send(pkt)
+		errCh <- backend.SendContext(ctx, pkt)
 	}()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	ctx := backend.Context()
 	select {
 	case err := <-errCh:
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errBackendDialTimeout
+		}
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		s.retireBackend(backend, "backend dial request send timed out")
+		return resolveDialSendOnContextDone(ctx, errCh)
+	}
+}
+
+func resolveDialSendOnContextDone(ctx context.Context, errCh <-chan error) error {
+	select {
+	case err := <-errCh:
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errBackendDialTimeout
+		}
+		return err
+	default:
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errBackendDialTimeout
 	}
+	return ctx.Err()
 }
 
 func (s *ProxyServer) startPendingDialTimeout(random int64, backend *Backend, frontend *GrpcFrontend) {
@@ -396,12 +461,6 @@ func (s *ProxyServer) removeBackend(backend *Backend) {
 	}
 }
 
-func (s *ProxyServer) retireBackend(backend *Backend, reason string) {
-	backend.Retire()
-	klog.V(2).InfoS("Retire backend connection", "agentID", backend.GetAgentID(), "reason", reason)
-	s.removeBackend(backend)
-}
-
 func (s *ProxyServer) addEstablished(agentID string, connID int64, p *ProxyClientConnection) {
 	s.fmu.Lock()
 	defer s.fmu.Unlock()
@@ -412,6 +471,30 @@ func (s *ProxyServer) addEstablished(agentID string, connID int64, p *ProxyClien
 	s.established[agentID][connID] = p
 
 	metrics.Metrics.SetEstablishedConnCount(s.getCount(s.established))
+}
+
+// claimDialResponse atomically claims a pending dial. A successful response is
+// promoted to established before ownershipMu is released, so frontend stream
+// cleanup must observe the connection in exactly one ownership map.
+func (s *ProxyServer) claimDialResponse(random int64, agentID string, connID int64, establish bool) *ProxyClientConnection {
+	s.ownershipMu.Lock()
+	defer s.ownershipMu.Unlock()
+
+	frontend := s.PendingDial.Remove(random)
+	if frontend == nil || !establish {
+		return frontend
+	}
+	frontend.connectID = connID
+	// HTTP CONNECT records the selected agent before entering its timeout
+	// select, so do not rewrite that field concurrently with timeout logging.
+	if frontend.Mode == ModeGRPC {
+		frontend.agentID = agentID
+	}
+	if s.afterPendingDialRemoval != nil {
+		s.afterPendingDialRemoval()
+	}
+	s.addEstablished(agentID, connID, frontend)
+	return frontend
 }
 
 func (s *ProxyServer) removeEstablished(agentID string, connID int64) *ProxyClientConnection {
@@ -508,7 +591,22 @@ func (s *ProxyServer) removeEstablishedForStream(streamUID string) []*ProxyClien
 			delete(s.established, agentID)
 		}
 	}
+	metrics.Metrics.SetEstablishedConnCount(s.getCount(s.established))
 	return ret
+}
+
+// removeConnectionsForStream takes ownership of both map scans as one
+// lifecycle operation. Packet delivery for the returned connections happens
+// after this method releases all lifecycle and map locks.
+func (s *ProxyServer) removeConnectionsForStream(streamUID string) ([]*ProxyClientConnection, []*ProxyClientConnection) {
+	if s.afterFrontendStreamLockContention == nil {
+		s.ownershipMu.Lock()
+	} else if !s.ownershipMu.TryLock() {
+		s.afterFrontendStreamLockContention()
+		s.ownershipMu.Lock()
+	}
+	defer s.ownershipMu.Unlock()
+	return s.PendingDial.removeForStream(streamUID), s.removeEstablishedForStream(streamUID)
 }
 
 // NewProxyServer creates a new ProxyServer instance
@@ -571,12 +669,13 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 		// The frontend stream and goroutines are completely shut down, so we will never get a
 		// subsequent close message from the frontend. This can happen for several reasons, such as
 		// stream canceled. Clean any lingering tunnel connections to avoid resource leaks.
-		for _, p := range s.PendingDial.removeForStream(streamUID) {
+		pending, established := s.removeConnectionsForStream(streamUID)
+		for _, p := range pending {
 			klog.V(2).InfoS("frontend stream shutdown, cleaning dial", "dialID", p.dialID)
 			// TODO: add agent support to handle this
 			s.sendBackendDialClose(p.backend, p.dialID, "frontend stream shutdown")
 		}
-		for _, f := range s.removeEstablishedForStream(streamUID) {
+		for _, f := range established {
 			klog.V(2).InfoS("frontend stream shutdown, cleaning frontend", "connectionID", f.connectID, "dialID", f.dialID)
 			s.sendBackendClose(f.backend, f.connectID, f.dialID, "frontend stream shutdown")
 		}
@@ -700,13 +799,15 @@ func (s *ProxyServer) serveRecvFrontend(frontend *GrpcFrontend, recvCh <-chan *c
 				})
 			if err := s.sendDialRequestToBackend(backend, pkt); err != nil {
 				klog.ErrorS(err, "DIAL_REQ to Backend failed", "dialID", random)
-				if s.PendingDial.Remove(random) != nil {
-					reason := metrics.DialFailureBackendClose
-					if errors.Is(err, errBackendDialTimeout) {
-						reason = metrics.DialFailureBackendDialTimeout
-					}
-					metrics.Metrics.ObserveDialFailure(reason)
+				if s.PendingDial.Remove(random) == nil {
+					// A response or cancellation already claimed this dial.
+					continue
 				}
+				reason := metrics.DialFailureBackendClose
+				if errors.Is(err, errBackendDialTimeout) {
+					reason = metrics.DialFailureBackendDialTimeout
+				}
+				metrics.Metrics.ObserveDialFailure(reason)
 				resp := &client.Packet{
 					Type: client.PacketType_DIAL_RSP,
 					Payload: &client.Packet_DialResponse{
@@ -972,8 +1073,29 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 	}()
 
 	defer func() {
+		// Fail dials that were still in flight over this backend. The agent
+		// cannot answer them after its stream closes.
+		for _, frontend := range s.PendingDial.removeForBackend(backend) {
+			klog.V(2).InfoS("Agent connection closed, failing pending dial",
+				"agentID", agentID, "dialID", frontend.dialID, "dialAddress", frontend.dialAddress)
+			metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendClose)
+			pkt := &client.Packet{
+				Type: client.PacketType_DIAL_RSP,
+				Payload: &client.Packet_DialResponse{
+					DialResponse: &client.DialResponse{
+						Random: frontend.dialID,
+						Error:  errBackendClosedWhileDialing.Error(),
+					},
+				},
+			}
+			if err := frontend.send(pkt); err != nil {
+				klog.V(2).ErrorS(err, "DIAL_RSP for closed agent connection failed",
+					"agentID", agentID, "dialID", frontend.dialID)
+			}
+			frontend.publishDialResult(false)
+		}
+
 		// Close all established connections when the agent connection is closed
-		// TODO(#126): connections in PendingDial state should also be closed.
 		established, err := s.removeEstablishedForBackendConn(agentID, backend)
 		if err != nil {
 			return
@@ -1003,7 +1125,7 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 			resp := pkt.GetDialResponse()
 			klog.V(5).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 
-			frontend := s.PendingDial.Remove(resp.Random)
+			frontend := s.claimDialResponse(resp.Random, agentID, resp.ConnectID, resp.Error == "")
 			if frontend == nil {
 				klog.V(2).InfoS("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 				metrics.Metrics.ObserveDialFailure(metrics.DialFailureUnrecognizedResponse)
@@ -1011,35 +1133,34 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 					s.sendBackendClose(backend, resp.ConnectID, resp.Random, "unknown dial id")
 				}
 			} else {
-				dialErr := false
 				if resp.Error != "" {
-					// Dial response with error should not contain a valid ConnID.
+					// Dial response with error should not contain a valid ConnID,
+					// so there is no connection to establish. Just pass the
+					// failure on to the frontend.
 					klog.ErrorS(errors.New(resp.Error), "DIAL_RSP contains failure", "dialID", resp.Random, "agentID", agentID)
 					metrics.Metrics.ObserveDialFailure(metrics.DialFailureErrorResponse)
-					dialErr = true
+					if err := frontend.send(pkt); err != nil {
+						klog.ErrorS(err, "DIAL_RSP send to frontend stream failure",
+							"dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+					}
+					frontend.publishDialResult(false)
+					break
 				}
-				err := frontend.send(pkt)
-				if err != nil {
+				if err := frontend.send(pkt); err != nil {
 					klog.ErrorS(err, "DIAL_RSP send to frontend stream failure",
 						"dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
-					if !dialErr { // Avoid double-counting.
-						metrics.Metrics.ObserveDialFailure(metrics.DialFailureSendResponse)
-					}
+					metrics.Metrics.ObserveDialFailure(metrics.DialFailureSendResponse)
 					// If we never finish setting up the tunnel for ConnectID, then the connection is dead.
 					// Currently, the agent will no resend DIAL_RSP, so connection is dead.
 					// We already attempted to tell the frontend that. We should ensure we tell the backend.
-					s.sendBackendClose(backend, resp.ConnectID, resp.Random, "dial error")
-					dialErr = true
-				}
-				// Avoid adding the frontend if there was an error dialing the destination
-				if dialErr {
+					if s.removeEstablished(agentID, resp.ConnectID) != nil {
+						s.sendBackendClose(backend, resp.ConnectID, resp.Random, "dial error")
+					}
+					frontend.publishDialResult(false)
 					break
 				}
-				frontend.connectID = resp.ConnectID
-				frontend.agentID = agentID
-				// TODO: this connection may be cleaned on serveRecvFrontend exit, make it independent.
-				s.addEstablished(agentID, resp.ConnectID, frontend)
 				close(frontend.connected)
+				frontend.publishDialResult(true)
 				metrics.Metrics.ObserveDialLatency(time.Since(frontend.start))
 				klog.V(3).InfoS("Proxy connection established",
 					"dialID", resp.Random,
@@ -1069,6 +1190,7 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 					"dialDuration", time.Since(frontend.start),
 				)
 				metrics.Metrics.ObserveDialFailure(metrics.DialFailureBackendClose)
+				frontend.publishDialResult(false)
 			}
 
 		case client.PacketType_DATA:

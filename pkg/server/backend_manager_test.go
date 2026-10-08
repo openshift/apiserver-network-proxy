@@ -18,12 +18,15 @@ package server
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/metadata"
 
+	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	agentmock "sigs.k8s.io/apiserver-network-proxy/proto/agent/mocks"
 )
 
@@ -102,6 +105,63 @@ func TestNewBackend(t *testing.T) {
 				t.Errorf("NewBackend got err %q; wantErr = %t", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestBackendSendContextCancellation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	agentConn := mockAgentConn(ctrl, "agent1", nil)
+	backend, err := NewBackend(agentConn)
+	if err != nil {
+		t.Fatalf("NewBackend returned error: %v", err)
+	}
+
+	if err := backend.lockSend(context.Background(), nil); err != nil {
+		t.Fatalf("lockSend returned error: %v", err)
+	}
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			backend.unlockSend()
+		}
+	})
+
+	const workers = 5
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waiting := make(chan struct{}, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			errs <- backend.sendContext(ctx, dialReqPkt(100), func() { waiting <- struct{}{} })
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		select {
+		case <-waiting:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for sender to reach contended lock acquisition")
+		}
+	}
+	cancel()
+	for i := 0; i < workers; i++ {
+		var err error
+		select {
+		case err = <-errs:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for canceled sender")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("SendContext returned %v, want context.Canceled", err)
+		}
+	}
+
+	backend.unlockSend()
+	locked = false
+	valid := &client.Packet{Type: client.PacketType_DATA}
+	agentConn.EXPECT().Send(valid).Return(nil).Times(1)
+	if err := backend.SendContext(context.Background(), valid); err != nil {
+		t.Fatalf("SendContext after cancellation returned error: %v", err)
 	}
 }
 
