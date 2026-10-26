@@ -242,7 +242,7 @@ func TestReusableTunnel_ConcurrentDials_Isolated(t *testing.T) {
 
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("dial %d: %v", i, err)
+			t.Errorf("dial %d: %v", i, err)
 		}
 	}
 
