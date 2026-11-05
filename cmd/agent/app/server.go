@@ -137,6 +137,7 @@ func (a *Agent) runProxyConnection(o *options.GrpcProxyAgentOptions, drainCh, st
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                o.KeepaliveTime,
+			Timeout:             o.KeepaliveTimeout,
 			PermitWithoutStream: true,
 		}),
 	}
@@ -264,6 +265,8 @@ func (a *Agent) runAdminServer(o *options.GrpcProxyAgentOptions) error {
 		}
 		dest := *r.URL
 		dest.Host = net.JoinHostPort(host, strconv.Itoa(o.HealthServerPort))
+		// Sanitize the redirect url
+		// #nosec G710
 		http.Redirect(w, r, dest.String(), http.StatusMovedPermanently)
 	}))
 	if o.EnableProfiling {
