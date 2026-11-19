@@ -39,6 +39,8 @@ type ProxyServerOpts struct {
 	ServerCount int
 	Mode        string
 	AgentPort   int // Defaults to random port.
+	// Nil keeps the server default; a pointer to zero disables the writer queue.
+	FrontendWriteChannelSize *int
 }
 
 type ProxyServerRunner interface {
@@ -143,9 +145,22 @@ func serverOptions(t testing.TB, opts ProxyServerOpts) (*serveropts.ProxyRunOpti
 
 	o.ServerCount = opts.ServerCount
 	o.Mode = opts.Mode
+	if opts.FrontendWriteChannelSize != nil {
+		o.FrontendWriteChannelSize = *opts.FrontendWriteChannelSize
+	}
 
+	// macOS limits socket paths to 104 bytes including the NUL, and $TMPDIR
+	// is long there. Trim the uid to fit.
+	const maxUdsPath = 103
+	prefix := filepath.Join(CertsDir, "server-")
 	uid := uuid.New().String()
-	o.UdsName = filepath.Join(CertsDir, fmt.Sprintf("server-%s.sock", uid))
+	if n := maxUdsPath - len(prefix) - len(".sock"); n < len(uid) {
+		if n < 8 {
+			return nil, fmt.Errorf("CertsDir %q is too long for a socket path", CertsDir)
+		}
+		uid = uid[:n]
+	}
+	o.UdsName = prefix + uid + ".sock"
 	o.ServerPort = 0 // Required for UDS
 
 	o.ClusterCert = filepath.Join(CertsDir, TestServerCertFile)

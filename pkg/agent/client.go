@@ -199,9 +199,8 @@ func (a *Client) Connect() (int, error) {
 		header.AgentIdentifiers, a.agentIdentifiers)
 	if a.serviceAccountTokenPath != "" {
 		if ctx, err = a.initializeAuthContext(ctx); err != nil {
-			err := conn.Close()
-			if err != nil {
-				klog.ErrorS(err, "failed to close gRPC connection", "agentID", a.agentID)
+			if cerr := conn.Close(); cerr != nil {
+				klog.ErrorS(cerr, "failed to close gRPC connection", "agentID", a.agentID)
 			}
 			return 0, err
 		}
@@ -232,10 +231,11 @@ func (a *Client) Connect() (int, error) {
 func (a *Client) Close() {
 	if a.conn == nil {
 		klog.Errorln("Unexpected empty AgentClient.conn")
-	}
-	err := a.conn.Close()
-	if err != nil {
-		klog.ErrorS(err, "failed to close gRPC connection", "serverID", a.serverID, "agentID", a.agentID)
+	} else {
+		err := a.conn.Close()
+		if err != nil {
+			klog.ErrorS(err, "failed to close gRPC connection", "serverID", a.serverID, "agentID", a.agentID)
+		}
 	}
 	close(a.stopCh)
 }
@@ -250,7 +250,9 @@ func (a *Client) Send(pkt *client.Packet) error {
 	if err != nil && err != io.EOF {
 		metrics.Metrics.ObserveServerFailureDeprecated(metrics.DirectionToServer)
 		metrics.Metrics.ObserveStreamError(segment, err, pkt.Type)
-		a.cs.RemoveClient(a.serverID)
+		if a.cs.removeClient(a) {
+			metrics.Metrics.ObserveServerConnectionLost(metrics.ServerConnectionLostSendError)
+		}
 	}
 	return err
 }
@@ -326,7 +328,7 @@ func (a *Client) initializeAuthContext(ctx context.Context) (context.Context, er
 // The requests include things like opening a connection to a server,
 // streaming data and close the connection.
 func (a *Client) Serve() {
-	defer a.cs.RemoveClient(a.serverID)
+	defer a.cs.removeClient(a)
 	defer func() {
 		// close all of conns with remote when Client exits
 		for _, eConn := range a.connManager.List() {
@@ -348,20 +350,27 @@ func (a *Client) Serve() {
 
 		pkt, err := a.Recv()
 		if err != nil {
-			if err == io.EOF {
-				klog.V(2).InfoS("received EOF, exit", "serverID", a.serverID, "agentID", a.agentID)
+			select {
+			case <-a.stopCh:
+				// The agent closed this client itself (shutdown, send failure or probe).
+				klog.V(5).InfoS("could not read stream because agent client is shutting down", "serverID", a.serverID, "agentID", a.agentID, "err", err)
 				return
+			default:
 			}
-			if status.Code(err) == codes.Canceled {
+			var reason metrics.ServerConnectionLostReason
+			switch {
+			case err == io.EOF:
+				klog.V(2).InfoS("received EOF, exit", "serverID", a.serverID, "agentID", a.agentID)
+				reason = metrics.ServerConnectionLostEOF
+			case status.Code(err) == codes.Canceled:
 				klog.V(2).InfoS("stream canceled", "serverID", a.serverID, "agentID", a.agentID)
-			} else {
-				select {
-				case <-a.stopCh:
-					klog.V(5).InfoS("could not read stream because agent client is shutting down", "serverID", a.serverID, "agentID", a.agentID, "err", err)
-				default:
-					// If stopCh is not closed, this is a legitimate, unexpected error.
-					klog.ErrorS(err, "could not read stream", "serverID", a.serverID, "agentID", a.agentID)
-				}
+				reason = metrics.ServerConnectionLostCancelled
+			default:
+				klog.ErrorS(err, "could not read stream", "serverID", a.serverID, "agentID", a.agentID)
+				reason = metrics.ServerConnectionLostRecvError
+			}
+			if a.cs.removeClient(a) {
+				metrics.Metrics.ObserveServerConnectionLost(reason)
 			}
 			return
 		}
@@ -443,7 +452,7 @@ func (a *Client) Serve() {
 				"dialID", strconv.FormatInt(dialReq.Random, 10),
 				"dialAddress", dialReq.Address,
 			)
-			go runpprof.Do(context.Background(), labels, func(context.Context) {
+			go runpprof.Do(context.Background(), labels, func(ctx context.Context) {
 				defer close(dialDone)
 				start := time.Now()
 				conn, err := net.DialTimeout(dialReq.Protocol, dialReq.Address, dialTimeout)
@@ -501,12 +510,12 @@ func (a *Client) Serve() {
 					// So we are invoking it here to force the clean-up to occur.
 					// However, cleanup will block until dialDone is closed.
 					// So placing cleanup on its own goroutine to wait for the deferred close(dialDone) to kick in.
-					go runpprof.Do(context.Background(), labels, func(context.Context) { eConn.cleanup() })
+					go runpprof.Do(ctx, labels, func(context.Context) { eConn.cleanup() })
 					return
 				}
-				go runpprof.Do(context.Background(), labels, func(context.Context) { a.remoteToSendChannel(connID, eConn) })
-				go runpprof.Do(context.Background(), labels, func(context.Context) { a.sendChannelToProxy(connID, eConn) })
-				go runpprof.Do(context.Background(), labels, func(context.Context) { a.dataChannelToRemote(connID, eConn) })
+				go runpprof.Do(ctx, labels, func(context.Context) { a.remoteToSendChannel(connID, eConn) })
+				go runpprof.Do(ctx, labels, func(context.Context) { a.sendChannelToProxy(connID, eConn) })
+				go runpprof.Do(ctx, labels, func(context.Context) { a.dataChannelToRemote(connID, eConn) })
 			})
 
 		case client.PacketType_DATA:
@@ -669,8 +678,7 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 			// We failed to write to the muxed tunnel back to the ANP Server.
 			// Chances are something is fairly wrong. Going to close out what
 			// we are doing so we don't leave hanging goroutines.
-			// Not worried about queued packets as the cleanup will handle it.
-			go eConn.cleanup()
+			// Not worried about queued packets as the clean up should handle it.
 			return
 		}
 	}
@@ -742,7 +750,9 @@ func (a *Client) probe() {
 			}
 		}
 		klog.V(1).InfoS("Removing client used for server connection", "state", a.conn.GetState(), "serverID", a.serverID)
-		a.cs.RemoveClient(a.serverID)
+		if a.cs.removeClient(a) {
+			metrics.Metrics.ObserveServerConnectionLost(metrics.ServerConnectionLostProbe)
+		}
 		return
 	}
 }
