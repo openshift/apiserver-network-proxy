@@ -69,13 +69,15 @@ Currently, we are using go.uber.org/mock/mockgen@v0.6.0
 
 Proto definitions are compiled with `protoc`. Please ensure you have protoc installed ([Instructions](https://grpc.io/docs/languages/go/quickstart/)) and the `protoc-gen-go` and `protoc-gen-go-grpc` libraries at the appropriate version.
 
-Currently, we are using protoc-gen-go@v1.27.1
+Currently, we are using protoc v36.2 (`libprotoc 36.2`)
 
-`go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1`
+Currently, we are using protoc-gen-go@v1.36.12
+ 
+`go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12`
 
-Currently, we are using protoc-gen-go-grpc@v1.2
+Currently, we are using protoc-gen-go-grpc@v1.6.2
 
-`go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2`
+`go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2`
 
 ### Local builds
 

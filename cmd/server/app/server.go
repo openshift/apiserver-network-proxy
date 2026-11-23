@@ -151,6 +151,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	}
 	p.server = server.NewProxyServer(o.ServerID, ps, o.ServerCount, authOpt, o.XfrChannelSize)
 	p.server.SetBackendDialTimeout(o.BackendDialTimeout)
+	p.server.SetFrontendWriteChannelSize(o.FrontendWriteChannelSize)
 
 	frontendStop, err := p.runFrontendServer(ctx, o, p.server)
 	if err != nil {
@@ -382,7 +383,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsGrpcFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -395,6 +396,10 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 				Server: s,
 			},
 		}
+		udsListener, err := getUDSListener(ctx, o.UdsName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get uds listener: %v", err)
+		}
 		stop = func(shutdownCtx context.Context) error {
 			return server.Shutdown(shutdownCtx)
 		}
@@ -402,17 +407,12 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 			"core", "udsHttpFrontend",
 			"udsFile", o.UdsName,
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
-			udsListener, err := getUDSListener(ctx, o.UdsName)
-			if err != nil {
-				klog.ErrorS(err, "failed to get uds listener")
-			}
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			defer func() {
 				err := udsListener.Close()
 				klog.ErrorS(err, "failed to close uds listener")
 			}()
-			err = server.Serve(udsListener)
-			if err != nil {
+			if err := server.Serve(udsListener); err != nil {
 				klog.ErrorS(err, "failed to serve uds requests")
 			}
 		})
@@ -454,7 +454,7 @@ func (p *Proxy) getTLSConfig(caFile, certFile, keyFile string, cipherSuites []st
 	return tlsConfig, nil
 }
 
-func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
+func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOptions, s *server.ProxyServer) (StopFunc, error) {
 	var stop StopFunc
 
 	var tlsConfig *tls.Config
@@ -480,7 +480,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsGrpcFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) { grpcServer.Serve(lis) })
+		go runpprof.Do(ctx, labels, func(context.Context) { grpcServer.Serve(lis) })
 		stop = func(_ context.Context) error {
 			grpcServer.GracefulStop()
 			return nil
@@ -503,7 +503,7 @@ func (p *Proxy) runMTLSFrontendServer(_ context.Context, o *options.ProxyRunOpti
 			"core", "mtlsHttpFrontend",
 			"port", strconv.Itoa(o.ServerPort),
 		)
-		go runpprof.Do(context.Background(), labels, func(context.Context) {
+		go runpprof.Do(ctx, labels, func(context.Context) {
 			err := server.ListenAndServeTLS("", "") // empty files defaults to tlsConfig
 			if err != nil {
 				klog.ErrorS(err, "failed to listen on frontend port")
@@ -524,7 +524,7 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 	addr := net.JoinHostPort(o.AgentBindAddress, strconv.Itoa(o.AgentPort))
 	agentServerOptions := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime, Timeout: o.KeepaliveTimeout}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             30 * time.Second,
 			PermitWithoutStream: true,
