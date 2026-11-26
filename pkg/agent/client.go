@@ -678,8 +678,7 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 			// We failed to write to the muxed tunnel back to the ANP Server.
 			// Chances are something is fairly wrong. Going to close out what
 			// we are doing so we don't leave hanging goroutines.
-			// Not worried about queued packets as the cleanup will handle it.
-			go eConn.cleanup()
+			// Not worried about queued packets as the clean up should handle it.
 			return
 		}
 	}
